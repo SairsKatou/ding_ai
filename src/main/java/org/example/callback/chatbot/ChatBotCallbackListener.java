@@ -117,19 +117,18 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
     private String handleUserQuery(String userQuestion) {
         if (StringUtils.isBlank(userQuestion) || userQuestion.equalsIgnoreCase("help")
                 || userQuestion.equals("帮助") || userQuestion.equals("菜单")) {
-            return "💡 您好！我是智能开发助理机器人：\n"
-                    + "👉 查询分支：输入「项目列表」或「查询 <项目名>」\n"
-                    + "👉 创建分支：输入「创建分支 <仓库名> <新分支名> [源分支]」\n"
-                    + "👉 克隆分支：输入「克隆分支 <仓库名> [分支名/不填默认dev]」（先删历史再拉最新，锁定2小时）\n"
-                    + "👉 分支代码扫描分析：输入「扫描项目 <项目名> 分支 <分支名> <具体诉求>」\n"
-                    + "   （示例：`扫描项目 changtai-cloud 分支 dev 梳理实报使用的地方`）\n"
-                    + "👉 OpenCode 大模型问答：直接输入任何技术或代码问题即可获得解答！";
+            return buildHelpMenu();
         }
 
-        // 1. 分支代码扫描与大模型分析指令
+        // 1. 分支代码扫描与大模型分析指令 (支持普通扫描与 Agent 多轮深度探查)
         if (userQuestion.startsWith("扫描")
+                || userQuestion.startsWith("深度扫描")
+                || userQuestion.startsWith("深度代码扫描")
+                || userQuestion.startsWith("代码深度扫描")
                 || userQuestion.startsWith("分析分支")
                 || userQuestion.startsWith("代码扫描")
+                || userQuestion.startsWith("扫描代码")
+                || userQuestion.startsWith("分支扫描")
                 || userQuestion.startsWith("审计分支")) {
             return yunxiaoCodeScanService.scanAndAnalyzeForChat(userQuestion);
         }
@@ -179,5 +178,37 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
             log.error("大模型对话处理异常: " + e.getMessage(), e);
             return "❌ AI 助手回答异常: " + e.getMessage();
         }
+    }
+
+    /**
+     * 构建 Markdown 格式的群聊机器人帮助菜单
+     *
+     * @return 帮助菜单 Markdown 文本
+     */
+    private String buildHelpMenu() {
+        return "### 💡 您好！我是智能开发助理机器人\n\n"
+                + "> 随时为您提供项目检索、分支管理与大模型智能代码审计支持。\n\n"
+                + "---\n\n"
+                + "#### 📌 常用指令指南\n\n"
+                + "1. **项目与分支查询**\n"
+                + "   - 指令：`项目列表` 或 `查询 <项目名>`\n"
+                + "   - 示例：`查询 changtai-cloud`\n\n"
+                + "2. **创建代码分支**\n"
+                + "   - 指令：`创建分支 <仓库名> <新分支名> [源分支]`\n"
+                + "   - 示例：`创建分支 changtai-cloud feature/20261022 dev`\n\n"
+                + "3. **克隆分支（本地 Git 缓存）**\n"
+                + "   - 指令：`克隆分支 [仓库名/默认changtai-cloud] [分支名/默认dev]`\n"
+                + "   - 说明：先清空历史克隆再拉取最新，本地缓存保留 2 小时\n"
+                + "   - 示例 1（默认仓库与分支）：`克隆分支`\n"
+                + "   - 示例 2（自定义分支）：`克隆分支 master` 或 `克隆分支 分支 master`\n"
+                + "   - 示例 3（自定义仓库与分支）：`克隆分支 changtai-cloud dev`\n\n"
+                + "4. **分支代码扫描与大模型分析**\n"
+                + "   - 普通扫描：`代码扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <具体诉求>`\n"
+                + "   - 深度探查（多轮 Agent）：`深度扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <具体诉求>`\n"
+                + "   - 示例 1（快速扫描）：`代码扫描 梳理实报费用新增的校验逻辑`\n"
+                + "   - 示例 2（多轮深度探查表名）：`深度扫描 调拨单涉及的表名是哪些`\n"
+                + "   - 示例 3（自定义分支）：`深度扫描 分支 dev 调拨单涉及的表名`\n\n"
+                + "5. **OpenCode 大模型通用问答**\n"
+                + "   - 直接在群内输入任何技术问题、SQL 调优或代码重构问题，即可实时解答！";
     }
 }

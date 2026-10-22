@@ -6,6 +6,7 @@ import org.example.config.YunxiaoProperties;
 import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 import org.example.domain.dto.YunxiaoRepoCacheMetadata;
 import org.example.domain.dto.YunxiaoRepositoryDTO;
+import org.example.service.impl.CodeSearchKeywordServiceImpl;
 import org.example.service.impl.YunxiaoGitCloneServiceImpl;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -62,6 +63,7 @@ public class YunxiaoGitCloneServiceTest {
 
         ReflectionTestUtils.setField(yunxiaoGitCloneService, "yunxiaoProperties", yunxiaoProperties);
         ReflectionTestUtils.setField(yunxiaoGitCloneService, "yunxiaoDevopsService", yunxiaoDevopsService);
+        ReflectionTestUtils.setField(yunxiaoGitCloneService, "codeSearchKeywordService", new CodeSearchKeywordServiceImpl());
     }
 
     @AfterEach
@@ -141,13 +143,27 @@ public class YunxiaoGitCloneServiceTest {
     }
 
     /**
-     * 测试群聊克隆分支指令说明
+     * 测试群聊克隆分支指令：仓库名不填时默认使用 changtai-cloud，分支名不填时默认使用 dev
      */
     @Test
-    public void testCloneBranchForChatEmpty() {
+    public void testCloneBranchForChatDefaultRepoAndBranch() {
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.emptyList());
+
         String result = yunxiaoGitCloneService.cloneBranchForChat("克隆分支");
         assertNotNull(result);
-        assertTrue(result.contains("克隆分支指令说明"));
+        assertTrue(result.contains("changtai-cloud"));
+    }
+
+    /**
+     * 测试群聊克隆分支指令：仅指定分支名，仓库名缺省为 changtai-cloud
+     */
+    @Test
+    public void testCloneBranchForChatDefaultRepoWithBranch() {
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.emptyList());
+
+        String result = yunxiaoGitCloneService.cloneBranchForChat("克隆分支 分支 master");
+        assertNotNull(result);
+        assertTrue(result.contains("changtai-cloud"));
     }
 
     /**

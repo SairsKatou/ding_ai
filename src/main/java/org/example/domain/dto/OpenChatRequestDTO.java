@@ -1,5 +1,7 @@
 package org.example.domain.dto;
 
+import com.alibaba.fastjson.annotation.JSONField;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
 import lombok.AllArgsConstructor;
@@ -53,4 +55,18 @@ public class OpenChatRequestDTO implements Serializable {
      */
     @ApiModelProperty(value = "是否流式返回", example = "false")
     private Boolean stream;
+
+    /**
+     * 大模型可用工具清单
+     */
+    @ApiModelProperty(value = "大模型可用工具清单")
+    private List<OpenChatToolDTO> tools;
+
+    /**
+     * 工具调用策略 (如 "auto" 或省略)
+     */
+    @JSONField(name = "tool_choice")
+    @JsonProperty("tool_choice")
+    @ApiModelProperty(value = "工具调用策略", example = "auto")
+    private Object toolChoice;
 }

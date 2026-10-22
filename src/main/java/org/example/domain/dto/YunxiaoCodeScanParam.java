@@ -52,4 +52,10 @@ public class YunxiaoCodeScanParam implements Serializable {
      */
     @ApiModelProperty(value = "最大分析文件数（本地模式最大 500，远程模式最大 30）", example = "500")
     private Integer maxFiles;
+
+    /**
+     * 是否启用多轮 Agent 深度代码探查模式 (Tool Calling)
+     */
+    @ApiModelProperty(value = "是否启用多轮 Agent 深度扫描", example = "false")
+    private Boolean deepScan;
 }

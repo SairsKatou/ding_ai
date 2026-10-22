@@ -63,6 +63,11 @@ public class Constants {
     public static final Integer TEN = 10;
 
     /**
+     * 数字 15 (Agent 工具单次最大返回项数)
+     */
+    public static final Integer FIFTEEN = 15;
+
+    /**
      * 数字 16 (线程池最大线程数)
      */
     public static final Integer SIXTEEN = 16;
@@ -176,6 +181,11 @@ public class Constants {
      * 2 小时毫秒数 (2 * 60 * 60 * 1000 = 7,200,000L)
      */
     public static final Long TWO_HOURS_MILLIS = 7200000L;
+
+    /**
+     * 默认代码库名称 changtai-cloud
+     */
+    public static final String DEFAULT_REPO_NAME = "changtai-cloud";
 
     /**
      * 默认分支名称 dev

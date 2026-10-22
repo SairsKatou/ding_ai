@@ -11,12 +11,15 @@ import org.example.config.YunxiaoProperties;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.YunxiaoCodeFileBlobDTO;
 import org.example.domain.dto.YunxiaoCodeFileTreeDTO;
+import org.example.domain.dto.YunxiaoCodeScanInstructionDTO;
 import org.example.domain.dto.YunxiaoCodeScanParam;
 import org.example.domain.dto.YunxiaoCodeScanResultDTO;
 import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 import org.example.domain.dto.YunxiaoRepositoryDTO;
 import org.example.domain.dto.YunxiaoRepositoryQueryParam;
+import org.example.service.CodeSearchKeywordService;
 import org.example.service.OpenCodeService;
+import org.example.service.YunxiaoCodeAgentService;
 import org.example.service.YunxiaoCodeScanService;
 import org.example.service.YunxiaoDevopsService;
 import org.example.service.YunxiaoGitCloneService;
@@ -111,6 +114,12 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
     @Resource
     private OpenCodeService openCodeService;
 
+    @Resource
+    private CodeSearchKeywordService codeSearchKeywordService;
+
+    @Resource
+    private YunxiaoCodeAgentService yunxiaoCodeAgentService;
+
     /**
      * 扫描指定云效代码库分支的代码，并结合用户提问交由大模型进行深度梳理分析
      *
@@ -140,7 +149,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         String question = param.getQuestion().trim();
 
         // 确定关键词与最大扫描文件数：本地分析最大 500，远程分析最大 30
-        String searchKeyword = resolveKeyword(param.getKeyword(), question);
+        String searchKeyword = codeSearchKeywordService.resolveCoreKeyword(param.getKeyword(), question);
         int localMaxFiles = param.getMaxFiles() != null && param.getMaxFiles() > Constants.ZERO
                 ? Math.min(param.getMaxFiles(), Constants.FIVE_HUNDRED)
                 : Constants.FIVE_HUNDRED;
@@ -162,6 +171,13 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
             try {
                 log.info("【方案 A 启动】准备仓库 [{}] 分支 [{}] 本地 Git 浅克隆缓存 (保留 2 小时)...", actualRepoName, branch);
                 File localRepoDir = yunxiaoGitCloneService.prepareLocalRepository(actualRepoId, actualRepoName, branch, cloneUrl);
+
+                // 若开启多轮 Agent 深度代码探查模式，转交 YunxiaoCodeAgentService 执行 Tool Calling
+                if (Boolean.TRUE.equals(param.getDeepScan())) {
+                    log.info("【多轮 Agent 深度扫描】启用 Tool Calling 闭环探查模式...");
+                    return yunxiaoCodeAgentService.executeDeepScan(param, localRepoDir, actualRepoName, actualRepoId);
+                }
+
                 matchedSnippets = yunxiaoGitCloneService.scanLocalRepository(localRepoDir, searchKeyword, localMaxFiles);
                 planASuccess = true;
                 log.info("【方案 A 成功】本地全量扫描完成，命中核心代码片段数: {} (最大上限: {})", matchedSnippets.size(), localMaxFiles);
@@ -214,6 +230,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
 
     /**
      * 解析钉钉群聊消息中的分支扫描指令并执行大模型分析
+     * 支持不指定项目名（默认 changtai-cloud）与不指定分支名（默认 dev）
      *
      * @param chatInput 用户群聊输入文本
      * @return 格式化后的分析报告文本
@@ -221,45 +238,32 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
     @Override
     public String scanAndAnalyzeForChat(String chatInput) {
         if (StringUtils.isBlank(chatInput)) {
-            return "❌ 请输入扫描指令，格式如：\n扫描项目 [项目名] 分支 [分支名] [提问诉求]\n例如：扫描项目 changtai-cloud 分支 dev 梳理实报使用的地方";
+            return buildHelpTip();
         }
 
-        // 正则解析支持多种常见提问格式：
-        // 1. 扫描项目 changtai-cloud 分支 dev 梳理实报使用的地方
-        // 2. 扫描分支 changtai-cloud dev 梳理实报
-        String repoName = null;
-        String branch = null;
-        String question = null;
-
-        Pattern p1 = Pattern.compile("(?:扫描|分析)(?:项目|仓库)?\\s*[:：]?\\s*([a-zA-Z0-9_\\-\\.]+)\\s*(?:的分支|分支)?\\s*[:：]?\\s*([a-zA-Z0-9_\\-\\.\\/]+)\\s*[,，\\s]+(.*)");
-        Matcher m1 = p1.matcher(chatInput.trim());
-        if (m1.find()) {
-            repoName = m1.group(Constants.ONE);
-            branch = m1.group(Constants.TWO);
-            question = m1.group(Constants.THREE);
-        } else {
-            // 空格拆分解析：如 "扫描 changtai-cloud dev 梳理实报使用的地方"
-            String clean = chatInput.replaceAll("^(扫描|代码扫描|分析代码|分支扫描)+", "").trim();
-            String[] parts = clean.split("\\s+");
-            if (parts.length >= Constants.THREE) {
-                repoName = parts[Constants.ZERO];
-                branch = parts[Constants.ONE];
-                // 剩余全部作为 question
-                question = clean.substring(clean.indexOf(branch) + branch.length()).trim();
-            }
+        // 解析群聊指令参数
+        YunxiaoCodeScanInstructionDTO instruction = parseInstruction(chatInput);
+        if (instruction == null || StringUtils.isBlank(instruction.getQuestion())) {
+            return buildHelpTip();
         }
 
-        if (StringUtils.isBlank(repoName) || StringUtils.isBlank(branch) || StringUtils.isBlank(question)) {
-            return "❌ 无法解析指令参数，请按照以下格式输入：\n"
-                    + "👉 **格式**：扫描项目 [项目名] 分支 [分支名] [具体诉求]\n"
-                    + "👉 **示例**：`扫描项目 changtai-cloud 分支 dev 梳理实报使用的地方`";
-        }
+        String repoName = instruction.getRepoName();
+        String branch = instruction.getBranch();
+        String question = instruction.getQuestion();
+        boolean isDeep = chatInput.startsWith("深度扫描")
+                || chatInput.startsWith("深度代码扫描")
+                || chatInput.startsWith("代码深度扫描")
+                || chatInput.contains("--deep");
+
+        log.info("群聊指令解析成功: 目标项目 [{}], 目标分支 [{}], 深度探查模式: [{}], 诉求 [{}]",
+                repoName, branch, isDeep, question);
 
         try {
             YunxiaoCodeScanParam param = YunxiaoCodeScanParam.builder()
                     .repositoryId(repoName)
                     .branch(branch)
                     .question(question)
+                    .deepScan(isDeep)
                     .build();
 
             YunxiaoCodeScanResultDTO result = scanAndAnalyzeBranch(param);
@@ -271,6 +275,123 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
             log.error("分支代码扫描大模型分析处理异常: {}", e.getMessage(), e);
             return "❌ 分支代码扫描分析失败: " + e.getMessage();
         }
+    }
+
+    /**
+     * 构建扫描指令格式提示说明
+     *
+     * @return 提示字符串
+     */
+    private String buildHelpTip() {
+        return "❌ 请输入具体代码扫描诉求，例如：\n"
+                + "👉 **默认项目与分支**：`代码扫描 梳理实报费用新增的校验逻辑`（默认项目：changtai-cloud，默认分支：dev）\n"
+                + "👉 **自定义分支**：`代码扫描 分支 dev 梳理实报费用新增的校验逻辑`\n"
+                + "👉 **自定义项目与分支**：`代码扫描 项目 changtai-cloud 分支 dev 梳理实报费用新增的校验逻辑`";
+    }
+
+    /**
+     * 解析钉钉群聊消息中的分支扫描指令
+     * 支持不指定项目名（默认 changtai-cloud）与不指定分支名（默认 dev）
+     *
+     * @param chatInput 用户群聊输入文本
+     * @return 解析后的指令对象，若无法提取诉求则返回 null
+     */
+    public YunxiaoCodeScanInstructionDTO parseInstruction(String chatInput) {
+        if (StringUtils.isBlank(chatInput)) {
+            return null;
+        }
+
+        // 1. 剔除前缀动作词
+        String clean = chatInput.trim().replaceFirst("^(?:深度代码扫描|代码深度扫描|深度扫描|分支代码扫描|代码扫描|扫描代码|扫描分支|分支扫描|分析分支|分析代码|审计分支|扫描|分析)\\s*", "").trim();
+        clean = clean.replaceFirst("^--deep\\s*", "").trim();
+        if (StringUtils.isBlank(clean)) {
+            return null;
+        }
+
+        String repoName = null;
+        String branch = null;
+        String question = clean;
+
+        // 2. 尝试提取显式关键字：项目/仓库
+        Pattern repoPattern = Pattern.compile("(?:项目|仓库)\\s*[:：]?\\s*([a-zA-Z0-9_\\-\\.]+)");
+        Matcher repoMatcher = repoPattern.matcher(question);
+        if (repoMatcher.find()) {
+            repoName = repoMatcher.group(Constants.ONE);
+            question = question.substring(Constants.ZERO, repoMatcher.start()) + " " + question.substring(repoMatcher.end());
+            question = question.trim();
+        }
+
+        // 3. 尝试提取显式关键字：分支
+        Pattern branchPattern = Pattern.compile("分支\\s*[:：]?\\s*([a-zA-Z0-9_\\-\\.\\/]+)");
+        Matcher branchMatcher = branchPattern.matcher(question);
+        if (branchMatcher.find()) {
+            branch = branchMatcher.group(Constants.ONE);
+            question = question.substring(Constants.ZERO, branchMatcher.start()) + " " + question.substring(branchMatcher.end());
+            question = question.trim();
+        }
+
+        // 4. 清理残留的分隔符（如开头的标点或冒号）
+        question = question.replaceAll("^[，,：:\\s]+", "").trim();
+
+        // 5. 如果没有通过关键字提取到仓库或分支，尝试从空格分隔的 tokens 中提取纯英文参数
+        if (StringUtils.isBlank(repoName) || StringUtils.isBlank(branch)) {
+            String[] tokens = question.split("\\s+");
+            if (tokens.length >= Constants.TWO) {
+                // 如果当前 repoName 为空，且首个 token 不包含中文（符合仓库名特征）
+                if (StringUtils.isBlank(repoName) && !containsChinese(tokens[Constants.ZERO])) {
+                    repoName = tokens[Constants.ZERO];
+                    int repoIdx = question.indexOf(repoName);
+                    question = question.substring(repoIdx + repoName.length()).trim();
+
+                    // 继续检查下一个 token 是否为分支名（若当前 branch 仍为空且下一个 token 不含中文）
+                    String[] remainingTokens = question.split("\\s+");
+                    if (StringUtils.isBlank(branch) && remainingTokens.length >= Constants.TWO && !containsChinese(remainingTokens[Constants.ZERO])) {
+                        branch = remainingTokens[Constants.ZERO];
+                        int branchIdx = question.indexOf(branch);
+                        question = question.substring(branchIdx + branch.length()).trim();
+                    }
+                } else if (StringUtils.isBlank(branch) && !containsChinese(tokens[Constants.ZERO])) {
+                    // 若已有 repoName，但 branch 为空，且首个 token 不含中文，则作为分支名
+                    branch = tokens[Constants.ZERO];
+                    int branchIdx = question.indexOf(branch);
+                    question = question.substring(branchIdx + branch.length()).trim();
+                }
+            }
+        }
+
+        // 6. 兜底默认值：若未指定项目名则默认 changtai-cloud，未指定分支名则默认 dev
+        if (StringUtils.isBlank(repoName)) {
+            repoName = Constants.DEFAULT_REPO_NAME;
+        }
+        if (StringUtils.isBlank(branch)) {
+            branch = Constants.DEFAULT_DEV_BRANCH;
+        }
+
+        // 清理最终的问题内容
+        question = question.replaceAll("^[，,：:\\s]+", "").trim();
+        if (StringUtils.isBlank(question)) {
+            return null;
+        }
+
+        return YunxiaoCodeScanInstructionDTO.builder()
+                .repoName(repoName)
+                .branch(branch)
+                .question(question)
+                .build();
+    }
+
+    /**
+     * 判断字符串中是否包含中文字符
+     *
+     * @param str 待检测字符串
+     * @return 是否包含中文
+     */
+    private boolean containsChinese(String str) {
+        if (StringUtils.isBlank(str)) {
+            return false;
+        }
+        return str.codePoints().anyMatch(codepoint ->
+                Character.UnicodeScript.of(codepoint) == Character.UnicodeScript.HAN);
     }
 
     /**
@@ -325,14 +446,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      * @return 最终关键词
      */
     private String resolveKeyword(String explicitKeyword, String question) {
-        if (StringUtils.isNotBlank(explicitKeyword)) {
-            return explicitKeyword.trim();
-        }
-        // 尝试从常见中文问题中提取关键词（如“梳理实报使用的地方” -> “实报”）
-        String cleaned = question.replaceAll("^(请|帮我|如何|怎样|梳理|查找|分析|查看|搜索|查询)+", "")
-                .replaceAll("(使用的地方|相关的代码|在哪些地方用到了|的具体实现|的逻辑|使用情况)+$", "")
-                .trim();
-        return StringUtils.isNotBlank(cleaned) ? cleaned : question;
+        return codeSearchKeywordService.resolveCoreKeyword(explicitKeyword, question);
     }
 
     /**
@@ -699,20 +813,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      * @return 衍生搜索词集合
      */
     private Set<String> buildSearchTokens(String keyword) {
-        Set<String> tokens = new HashSet<>();
-        tokens.add(keyword.toLowerCase());
-
-        // 针对常见业务词“实报”扩展关联词
-        if (keyword.contains("实报") || keyword.contains("报销")) {
-            tokens.add("actual");
-            tokens.add("actualreport");
-            tokens.add("actualreimburse");
-            tokens.add("actualreimbursement");
-            tokens.add("reimbursement");
-            tokens.add("reimburse");
-            tokens.add("shibao");
-        }
-        return tokens;
+        return codeSearchKeywordService.buildSearchTokens(keyword, keyword);
     }
 
     /**

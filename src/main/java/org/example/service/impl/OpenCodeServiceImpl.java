@@ -12,6 +12,7 @@ import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.OpenChatRequestDTO;
 import org.example.domain.dto.OpenChatResponseChoiceDTO;
 import org.example.domain.dto.OpenChatResponseDTO;
+import org.example.domain.dto.OpenChatToolDTO;
 import org.example.service.OpenCodeService;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -95,6 +96,19 @@ public class OpenCodeServiceImpl implements OpenCodeService {
      */
     @Override
     public String chat(List<OpenChatMessageDTO> messages) {
+        OpenChatMessageDTO reply = chatWithTools(messages, null);
+        return reply != null && reply.getContent() != null ? reply.getContent().trim() : "";
+    }
+
+    /**
+     * 带有可用工具的多轮提问对话 (支持大模型发起 Tool Calling)
+     *
+     * @param messages 历史对话消息列表
+     * @param tools    大模型可用工具列表
+     * @return 大模型回复消息对象
+     */
+    @Override
+    public OpenChatMessageDTO chatWithTools(List<OpenChatMessageDTO> messages, List<OpenChatToolDTO> tools) {
         if (CollectionUtils.isEmpty(messages)) {
             throw new IllegalArgumentException("提问内容不能为空");
         }
@@ -131,8 +145,10 @@ public class OpenCodeServiceImpl implements OpenCodeService {
                     log.info("开始调用第 {} 个模型 [{}], 该模型第 {}/{} 次尝试, 累计失败: {} 次",
                             modelIndex + Constants.ONE, modelName, attempt, maxRetriesPerModel, totalFailures);
 
-                    String reply = invokeSingleModel(apiUrl, apiKey, modelName, temperature, maxTokens, messages);
-                    log.info("大模型 [{}] 第 {} 次调用成功，回复内容长度: {}", modelName, attempt, reply.length());
+                    OpenChatMessageDTO reply = invokeSingleModelForMessage(apiUrl, apiKey, modelName, temperature, maxTokens, messages, tools);
+                    boolean hasTools = CollectionUtils.isNotEmpty(reply.getToolCalls());
+                    log.info("大模型 [{}] 第 {} 次调用成功，包含工具调用: {}, 内容长度: {}",
+                            modelName, attempt, hasTools, reply.getContent() != null ? reply.getContent().length() : Constants.ZERO);
                     return reply;
                 } catch (Exception e) {
                     totalFailures++;
@@ -158,7 +174,7 @@ public class OpenCodeServiceImpl implements OpenCodeService {
     }
 
     /**
-     * 调用单次大模型接口
+     * 调用单次大模型接口并返回消息对象
      *
      * @param apiUrl      接口地址
      * @param apiKey      API Key
@@ -166,12 +182,14 @@ public class OpenCodeServiceImpl implements OpenCodeService {
      * @param temperature 采样温度
      * @param maxTokens   最大 Token 数
      * @param messages    消息列表
-     * @return 回复内容
+     * @param tools       工具列表（可选）
+     * @return 回复消息对象
      * @throws Exception 调用异常
      */
-    private String invokeSingleModel(String apiUrl, String apiKey, String modelName,
-                                    Double temperature, Integer maxTokens,
-                                    List<OpenChatMessageDTO> messages) throws Exception {
+    private OpenChatMessageDTO invokeSingleModelForMessage(String apiUrl, String apiKey, String modelName,
+                                                           Double temperature, Integer maxTokens,
+                                                           List<OpenChatMessageDTO> messages,
+                                                           List<OpenChatToolDTO> tools) throws Exception {
         if (StringUtils.isBlank(apiKey)) {
             throw new IllegalArgumentException("模型 [" + modelName + "] 未配置有效的 apiKey，请在配置中设置 opencode.apiKey");
         }
@@ -182,6 +200,7 @@ public class OpenCodeServiceImpl implements OpenCodeService {
                 .temperature(temperature)
                 .maxTokens(maxTokens)
                 .stream(Boolean.FALSE)
+                .tools(CollectionUtils.isNotEmpty(tools) ? tools : null)
                 .build();
 
         HttpHeaders headers = new HttpHeaders();
@@ -210,11 +229,15 @@ public class OpenCodeServiceImpl implements OpenCodeService {
         }
 
         OpenChatResponseChoiceDTO firstChoice = responseDTO.getChoices().get(Constants.ZERO);
-        if (firstChoice == null || firstChoice.getMessage() == null
-                || StringUtils.isBlank(firstChoice.getMessage().getContent())) {
-            throw new RuntimeException("模型 [" + modelName + "] 未生成有效回复内容");
+        if (firstChoice == null || firstChoice.getMessage() == null) {
+            throw new RuntimeException("模型 [" + modelName + "] 未生成有效回复消息");
         }
 
-        return firstChoice.getMessage().getContent().trim();
+        OpenChatMessageDTO message = firstChoice.getMessage();
+        if (StringUtils.isBlank(message.getContent()) && CollectionUtils.isEmpty(message.getToolCalls())) {
+            throw new RuntimeException("模型 [" + modelName + "] 未生成有效回复文本且未调用任何工具: " + body);
+        }
+
+        return message;
     }
 }

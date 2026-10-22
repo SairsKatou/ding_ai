@@ -108,4 +108,17 @@ public class ChatBotCallbackListenerTest {
         // 验证已提交异步线程池执行
         verify(botMessageExecutor).execute(any(Runnable.class));
     }
+
+    /**
+     * 测试帮助菜单返回结构化 Markdown 内容
+     */
+    @Test
+    public void testHelpMenuReturnsMarkdown() {
+        Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "help");
+        assertNotNull(reply);
+        String text = reply.toString();
+        org.junit.jupiter.api.Assertions.assertTrue(text.contains("### 💡 您好！我是智能开发助理机器人"));
+        org.junit.jupiter.api.Assertions.assertTrue(text.contains("常用指令指南"));
+        org.junit.jupiter.api.Assertions.assertTrue(text.contains("changtai-cloud"));
+    }
 }

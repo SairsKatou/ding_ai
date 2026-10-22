@@ -10,6 +10,7 @@ import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 import org.example.domain.dto.YunxiaoRepoCacheMetadata;
 import org.example.domain.dto.YunxiaoRepositoryDTO;
 import org.example.domain.dto.YunxiaoRepositoryQueryParam;
+import org.example.service.CodeSearchKeywordService;
 import org.example.service.YunxiaoDevopsService;
 import org.example.service.YunxiaoGitCloneService;
 import org.springframework.stereotype.Service;
@@ -29,6 +30,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -70,6 +73,9 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
 
     @Resource
     private YunxiaoDevopsService yunxiaoDevopsService;
+
+    @Resource
+    private CodeSearchKeywordService codeSearchKeywordService;
 
     /**
      * 获取或准备本地克隆仓库目录（2 小时内直接复用缓存，过期或不存在时重新浅克隆）
@@ -161,7 +167,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
             return Collections.emptyList();
         }
 
-        Set<String> searchTokens = buildSearchTokens(searchKeyword);
+        Set<String> searchTokens = new HashSet<>(codeSearchKeywordService.buildSearchTokens(searchKeyword, searchKeyword));
         List<File> matchedFiles = new ArrayList<>();
 
         // 1. 毫秒级遍历本地全量文件树
@@ -193,6 +199,34 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
                 // 扫描内容
                 if (fileContainsTokens(file, searchTokens, searchKeyword)) {
                     matchedFiles.add(file);
+                }
+            }
+
+            // 3. 若初次检索未命中任何文件，借助大模型语义推理推断英文 token 进行二次兜底检索
+            if (matchedFiles.isEmpty()) {
+                Set<String> aiTokens = codeSearchKeywordService.inferEnglishTokensWithAI(searchKeyword);
+                if (CollectionUtils.isNotEmpty(aiTokens)) {
+                    log.info("初次扫描未命中，补充大模型推断英文 Token 二次检索: {}", aiTokens);
+                    searchTokens.addAll(aiTokens);
+                    for (File file : candidates) {
+                        String relativePath = getRelativePath(repoDir, file);
+                        boolean pathHit = false;
+                        for (String token : aiTokens) {
+                            if (relativePath.toLowerCase().contains(token)) {
+                                pathHit = true;
+                                break;
+                            }
+                        }
+
+                        if (pathHit) {
+                            matchedFiles.add(file);
+                            continue;
+                        }
+
+                        if (fileContainsTokens(file, aiTokens, searchKeyword)) {
+                            matchedFiles.add(file);
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
@@ -431,20 +465,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
      * @return 衍生搜索词集合
      */
     private Set<String> buildSearchTokens(String keyword) {
-        Set<String> tokens = new HashSet<>();
-        tokens.add(keyword.toLowerCase());
-
-        // 针对常见业务词“实报”扩展关联词
-        if (keyword.contains("实报") || keyword.contains("报销")) {
-            tokens.add("actual");
-            tokens.add("actualreport");
-            tokens.add("actualreimburse");
-            tokens.add("actualreimbursement");
-            tokens.add("reimbursement");
-            tokens.add("reimburse");
-            tokens.add("shibao");
-        }
-        return tokens;
+        return codeSearchKeywordService.buildSearchTokens(keyword, keyword);
     }
 
     /**
@@ -509,31 +530,87 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     }
 
     /**
-     * 解析钉钉群聊克隆分支指令，先删除历史克隆缓存，再拉取新增（若不指定分支则默认 dev）
+     * 解析钉钉群聊克隆分支指令，先删除历史克隆缓存，再拉取新增
+     * 支持仓库名缺省（默认 changtai-cloud）与分支名缺省（默认 dev）
      *
      * @param userQuestion 用户提问内容
      * @return 执行结果信息
      */
     @Override
     public String cloneBranchForChat(String userQuestion) {
-        // 去除指令前缀
+        // 去除指令前缀动作词
         String content = userQuestion.replaceAll("^(克隆分支|克隆项目|克隆代码|重新克隆|拉取分支)\\s*", "").trim();
-        if (StringUtils.isBlank(content)) {
-            return "💡 【克隆分支指令说明】\n"
-                    + "👉 指令格式：`克隆分支 <代码库名或ID> [分支名/不填默认dev]`\n"
-                    + "👉 示例 1（默认dev分支）：`克隆分支 changtai-cloud`\n"
-                    + "👉 示例 2（指定具体分支）：`克隆分支 changtai-cloud master`\n"
-                    + "📌 说明：执行时会**先清理历史本地缓存**，然后拉取最新代码并保留 2 小时。";
+
+        String repoIdOrName = null;
+        String branch = null;
+        boolean repoDefaulted = false;
+        boolean branchDefaulted = false;
+
+        if (StringUtils.isNotBlank(content)) {
+            String working = content;
+
+            // 1. 尝试显式匹配 "项目/仓库 xxx"
+            Pattern repoPattern = Pattern.compile("(?:项目|仓库)\\s*[:：]?\\s*([a-zA-Z0-9_\\-\\.]+)");
+            Matcher repoMatcher = repoPattern.matcher(working);
+            if (repoMatcher.find()) {
+                repoIdOrName = repoMatcher.group(Constants.ONE);
+                working = working.substring(Constants.ZERO, repoMatcher.start()) + " " + working.substring(repoMatcher.end());
+                working = working.trim();
+            }
+
+            // 2. 尝试显式匹配 "分支 xxx"
+            Pattern branchPattern = Pattern.compile("分支\\s*[:：]?\\s*([a-zA-Z0-9_\\-\\.\\/]+)");
+            Matcher branchMatcher = branchPattern.matcher(working);
+            if (branchMatcher.find()) {
+                branch = branchMatcher.group(Constants.ONE);
+                working = working.substring(Constants.ZERO, branchMatcher.start()) + " " + working.substring(branchMatcher.end());
+                working = working.trim();
+            }
+
+            // 3. 处理无显式关键字的纯参数
+            String[] tokens = working.split("\\s+");
+            List<String> cleanTokens = new ArrayList<>();
+            for (String token : tokens) {
+                if (StringUtils.isNotBlank(token)) {
+                    cleanTokens.add(token.trim());
+                }
+            }
+
+            if (!cleanTokens.isEmpty()) {
+                if (StringUtils.isBlank(repoIdOrName) && StringUtils.isBlank(branch)) {
+                    if (cleanTokens.size() == Constants.ONE) {
+                        String singleToken = cleanTokens.get(Constants.ZERO);
+                        // 若单个参数具有分支特征（如 dev、master、feature/* 等），则作为分支名；否则作为仓库名
+                        if (isLikelyBranchName(singleToken)) {
+                            branch = singleToken;
+                        } else {
+                            repoIdOrName = singleToken;
+                        }
+                    } else {
+                        // 两个及以上参数，首个为仓库，第二个为分支
+                        repoIdOrName = cleanTokens.get(Constants.ZERO);
+                        branch = cleanTokens.get(Constants.ONE);
+                    }
+                } else if (StringUtils.isBlank(repoIdOrName)) {
+                    repoIdOrName = cleanTokens.get(Constants.ZERO);
+                } else if (StringUtils.isBlank(branch)) {
+                    branch = cleanTokens.get(Constants.ZERO);
+                }
+            }
         }
 
-        String[] parts = content.split("\\s+");
-        String repoIdOrName = parts[Constants.ZERO];
-        // 如果未指定分支，默认使用 dev
-        String branch = parts.length > Constants.ONE && StringUtils.isNotBlank(parts[Constants.ONE])
-                ? parts[Constants.ONE].trim()
-                : Constants.DEFAULT_DEV_BRANCH;
+        // 4. 缺省值兜底：仓库名默认 changtai-cloud，分支名默认 dev
+        if (StringUtils.isBlank(repoIdOrName)) {
+            repoIdOrName = Constants.DEFAULT_REPO_NAME;
+            repoDefaulted = true;
+        }
+        if (StringUtils.isBlank(branch)) {
+            branch = Constants.DEFAULT_DEV_BRANCH;
+            branchDefaulted = true;
+        }
 
-        log.info("收到群聊克隆分支指令: 仓库 [{}], 分支 [{}]", repoIdOrName, branch);
+        log.info("收到群聊克隆分支指令: 仓库 [{}] (默认={}), 分支 [{}] (默认={})",
+                repoIdOrName, repoDefaulted, branch, branchDefaulted);
 
         try {
             // 解析匹配实际代码库
@@ -561,9 +638,13 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
 
             StringBuilder sb = new StringBuilder();
             sb.append("✅ **代码库分支克隆成功**\n\n");
-            sb.append("- **代码库**: `").append(actualRepoName).append("` (ID: ").append(actualRepoId).append(")\n");
+            sb.append("- **代码库**: `").append(actualRepoName).append("` (ID: ").append(actualRepoId).append(")");
+            if (repoDefaulted) {
+                sb.append(" _(未指定仓库，使用默认 changtai-cloud)_");
+            }
+            sb.append("\n");
             sb.append("- **克隆分支**: `").append(branch).append("`");
-            if (Constants.DEFAULT_DEV_BRANCH.equalsIgnoreCase(branch) && parts.length <= Constants.ONE) {
+            if (branchDefaulted) {
                 sb.append(" _(未指定分支，使用默认 dev)_");
             }
             sb.append("\n");
@@ -576,6 +657,32 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
             log.error("克隆分支异常: {}", e.getMessage(), e);
             return "❌ 克隆分支失败: " + e.getMessage();
         }
+    }
+
+    /**
+     * 判断字符串是否具有常见分支名的特征
+     *
+     * @param str 待检测字符串
+     * @return 是否符合分支名特征
+     */
+    private boolean isLikelyBranchName(String str) {
+        if (StringUtils.isBlank(str)) {
+            return false;
+        }
+        String lower = str.toLowerCase();
+        return lower.contains("/")
+                || lower.equals("dev")
+                || lower.equals("master")
+                || lower.equals("main")
+                || lower.equals("test")
+                || lower.equals("sit")
+                || lower.equals("uat")
+                || lower.equals("prod")
+                || lower.startsWith("feature")
+                || lower.startsWith("release")
+                || lower.startsWith("hotfix")
+                || lower.startsWith("bugfix")
+                || lower.startsWith("fix");
     }
 
     /**

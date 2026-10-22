@@ -4,10 +4,12 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.ct.common.core.constant.Constants;
 import org.example.config.YunxiaoProperties;
+import org.example.domain.dto.YunxiaoCodeScanInstructionDTO;
 import org.example.domain.dto.YunxiaoCodeScanParam;
 import org.example.domain.dto.YunxiaoCodeScanResultDTO;
 import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 import org.example.domain.dto.YunxiaoRepositoryDTO;
+import org.example.service.impl.CodeSearchKeywordServiceImpl;
 import org.example.service.impl.YunxiaoCodeScanServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -63,6 +65,9 @@ public class YunxiaoCodeScanServiceTest {
     @Mock
     private YunxiaoGitCloneService yunxiaoGitCloneService;
 
+    @Mock
+    private YunxiaoCodeAgentService yunxiaoCodeAgentService;
+
     private YunxiaoProperties yunxiaoProperties;
 
     @BeforeEach
@@ -77,6 +82,8 @@ public class YunxiaoCodeScanServiceTest {
         ReflectionTestUtils.setField(yunxiaoCodeScanService, "yunxiaoDevopsService", yunxiaoDevopsService);
         ReflectionTestUtils.setField(yunxiaoCodeScanService, "openCodeService", openCodeService);
         ReflectionTestUtils.setField(yunxiaoCodeScanService, "yunxiaoGitCloneService", yunxiaoGitCloneService);
+        ReflectionTestUtils.setField(yunxiaoCodeScanService, "codeSearchKeywordService", new CodeSearchKeywordServiceImpl());
+        ReflectionTestUtils.setField(yunxiaoCodeScanService, "yunxiaoCodeAgentService", yunxiaoCodeAgentService);
     }
 
     /**
@@ -226,5 +233,46 @@ public class YunxiaoCodeScanServiceTest {
 
         assertNotNull(chatReply);
         assertEquals("实报费用新增入口是 ScmActualReimbursementController.addReimbursement", chatReply);
+    }
+
+    /**
+     * 测试各种缺省项目与缺省分支的指令解析逻辑
+     */
+    @Test
+    public void testParseInstructionVariousFormats() {
+        // 1. 完全不指定项目和分支（默认 changtai-cloud 与 dev）
+        YunxiaoCodeScanInstructionDTO i1 = yunxiaoCodeScanService.parseInstruction("代码扫描 梳理实报费用新增的校验逻辑");
+        assertNotNull(i1);
+        assertEquals("changtai-cloud", i1.getRepoName());
+        assertEquals("dev", i1.getBranch());
+        assertEquals("梳理实报费用新增的校验逻辑", i1.getQuestion());
+
+        // 2. 仅指定分支（项目名缺省默认 changtai-cloud）
+        YunxiaoCodeScanInstructionDTO i2 = yunxiaoCodeScanService.parseInstruction("代码扫描 分支 master 梳理实报费用新增的校验逻辑");
+        assertNotNull(i2);
+        assertEquals("changtai-cloud", i2.getRepoName());
+        assertEquals("master", i2.getBranch());
+        assertEquals("梳理实报费用新增的校验逻辑", i2.getQuestion());
+
+        // 3. 仅指定项目（分支名缺省默认 dev）
+        YunxiaoCodeScanInstructionDTO i3 = yunxiaoCodeScanService.parseInstruction("扫描项目 my-cloud 梳理实报费用新增的校验逻辑");
+        assertNotNull(i3);
+        assertEquals("my-cloud", i3.getRepoName());
+        assertEquals("dev", i3.getBranch());
+        assertEquals("梳理实报费用新增的校验逻辑", i3.getQuestion());
+
+        // 4. 用户之前实际发送的完整指令
+        YunxiaoCodeScanInstructionDTO i4 = yunxiaoCodeScanService.parseInstruction("代码扫描 changtai-cloud 分支 dev 梳理实报费用新增的校验逻辑");
+        assertNotNull(i4);
+        assertEquals("changtai-cloud", i4.getRepoName());
+        assertEquals("dev", i4.getBranch());
+        assertEquals("梳理实报费用新增的校验逻辑", i4.getQuestion());
+
+        // 5. 空格分隔纯英文项目名+分支名
+        YunxiaoCodeScanInstructionDTO i5 = yunxiaoCodeScanService.parseInstruction("分支扫描 other-repo release/1.0 梳理实报");
+        assertNotNull(i5);
+        assertEquals("other-repo", i5.getRepoName());
+        assertEquals("release/1.0", i5.getBranch());
+        assertEquals("梳理实报", i5.getQuestion());
     }
 }
