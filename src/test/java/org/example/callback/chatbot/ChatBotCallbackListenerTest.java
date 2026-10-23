@@ -121,4 +121,36 @@ public class ChatBotCallbackListenerTest {
         org.junit.jupiter.api.Assertions.assertTrue(text.contains("常用指令指南"));
         org.junit.jupiter.api.Assertions.assertTrue(text.contains("changtai-cloud"));
     }
+
+	/**
+	 * 测试输入「查询 changtai-cloud」命中 DevOps 项目查询，而不是调用大模型
+	 */
+	@Test
+	public void testQueryProjectWithShortCommand() {
+		when(yunxiaoDevopsService.formatRepositoriesAndBranchesForChat(eq("changtai-cloud")))
+				.thenReturn("项目查询结果: changtai-cloud");
+
+		Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "查询 changtai-cloud");
+
+		assertNotNull(reply);
+		org.junit.jupiter.api.Assertions.assertEquals("项目查询结果: changtai-cloud", reply.toString());
+		verify(yunxiaoDevopsService).formatRepositoriesAndBranchesForChat("changtai-cloud");
+		verify(openCodeService, never()).chat(any(String.class));
+	}
+
+	/**
+	 * 测试输入「项目列表」列出全部项目
+	 */
+	@Test
+	public void testQueryProjectList() {
+		when(yunxiaoDevopsService.formatRepositoriesAndBranchesForChat(eq("")))
+				.thenReturn("全部项目列表");
+
+		Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "项目列表");
+
+		assertNotNull(reply);
+		org.junit.jupiter.api.Assertions.assertEquals("全部项目列表", reply.toString());
+		verify(yunxiaoDevopsService).formatRepositoriesAndBranchesForChat("");
+		verify(openCodeService, never()).chat(any(String.class));
+	}
 }
