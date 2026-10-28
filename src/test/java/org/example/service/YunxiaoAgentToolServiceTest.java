@@ -78,6 +78,127 @@ public class YunxiaoAgentToolServiceTest {
         assertFalse(tools.isEmpty());
         // 至少包含 search_files, grep_code, read_file_range 3 个工具
         assertTrue(tools.size() >= Constants.THREE);
+        assertTrue(tools.stream().anyMatch(t -> "find_table_usages".equals(t.getFunction().getName())));
+        assertTrue(tools.stream().anyMatch(t -> "get_mapper_sql".equals(t.getFunction().getName())));
+        assertTrue(tools.stream().anyMatch(t -> "read_method".equals(t.getFunction().getName())));
+    }
+
+    /**
+     * 测试 find_table_usages 汇总 @TableName、XML SQL、Java SQL 字符串与 BaseMapper 引用
+     */
+    @Test
+    public void testExecuteToolFindTableUsages() throws IOException {
+        writeBusinessFixture();
+
+        String output = yunxiaoAgentToolService.executeTool("find_table_usages", "{\"keyword\":\"allocation\"}", tempRepoDir);
+
+        assertTrue(output.contains("allocation_order  实体: AllocationOrder"));
+        assertTrue(output.contains("[@TableName]"));
+        assertTrue(output.contains("[BaseMapper]"));
+        // XML 中 join 的明细表
+        assertTrue(output.contains("allocation_order_detail"));
+        // 同模块 Service 中 SQL 字符串引用的联动流水表
+        assertTrue(output.contains("inventory_statement"));
+        // 普通文本与 XML 注释中的 from 不应识别为表
+        assertFalse(output.contains("server"));
+        assertFalse(output.contains("old_allocation_backup"));
+    }
+
+    /**
+     * 测试 get_mapper_sql 读取指定语句并展开 include 片段
+     */
+    @Test
+    public void testExecuteToolGetMapperSql() throws IOException {
+        writeBusinessFixture();
+
+        String output = yunxiaoAgentToolService.executeTool("get_mapper_sql",
+                "{\"mapper\":\"AllocationOrderMapper\",\"method\":\"selectPageList\"}", tempRepoDir);
+        assertTrue(output.contains("left join allocation_order_detail"));
+        assertTrue(output.contains("</select>"));
+        assertTrue(output.contains("<sql id=\"Base_Column_List\">"));
+        assertFalse(output.contains("deleteByNo"));
+
+        String list = yunxiaoAgentToolService.executeTool("get_mapper_sql", "{\"mapper\":\"AllocationOrderMapper\"}", tempRepoDir);
+        assertTrue(list.contains("<select id=\"selectPageList\">"));
+        assertTrue(list.contains("<delete id=\"deleteByNo\">"));
+    }
+
+    /**
+     * 测试 read_method 读取完整方法体，忽略调用处与字符串中的大括号
+     */
+    @Test
+    public void testExecuteToolReadMethod() throws IOException {
+        writeBusinessFixture();
+        String file = "src/main/java/com/ct/scm/service/impl/AllocationOrderServiceImpl.java";
+
+        String output = yunxiaoAgentToolService.executeTool("read_method",
+                "{\"file_path\":\"" + file + "\",\"method_name\":\"audit\"}", tempRepoDir);
+        assertTrue(output.contains("@Transactional"));
+        assertTrue(output.contains("insert into inventory_statement"));
+        assertTrue(output.contains("log.info(\"audit done }\")"));
+        assertFalse(output.contains("public void batchAudit"));
+
+        String mapperMethod = yunxiaoAgentToolService.executeTool("read_method",
+                "{\"file_path\":\"src/main/java/com/ct/scm/mapper/AllocationOrderMapper.java\",\"method_name\":\"selectPageList\"}",
+                tempRepoDir);
+        assertTrue(mapperMethod.contains("List<AllocationOrder> selectPageList(String no);"));
+
+        String missing = yunxiaoAgentToolService.executeTool("read_method",
+                "{\"file_path\":\"" + file + "\",\"method_name\":\"notExists\"}", tempRepoDir);
+        assertTrue(missing.contains("未找到方法"));
+    }
+
+    /**
+     * 构造 Mapper 接口、Mapper XML 与 Service 实现类
+     */
+    private void writeBusinessFixture() throws IOException {
+        writeFile("src/main/java/com/ct/scm/mapper/AllocationOrderMapper.java",
+                "package com.ct.scm.mapper;\n"
+                        + "public interface AllocationOrderMapper extends BaseMapper<AllocationOrder> {\n"
+                        + "    List<AllocationOrder> selectPageList(String no);\n"
+                        + "}\n");
+        writeFile("src/main/resources/mapper/AllocationOrderMapper.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                        + "<mapper namespace=\"com.ct.scm.mapper.AllocationOrderMapper\">\n"
+                        + "    <sql id=\"Base_Column_List\">a.id, a.allocation_no</sql>\n"
+                        + "    <!-- select * from old_allocation_backup -->\n"
+                        + "    <select id=\"selectPageList\">\n"
+                        + "        select <include refid=\"Base_Column_List\"/>\n"
+                        + "        from allocation_order a\n"
+                        + "        left join allocation_order_detail d on d.order_id = a.id\n"
+                        + "        where a.allocation_no = #{no}\n"
+                        + "    </select>\n"
+                        + "    <delete id=\"deleteByNo\">\n"
+                        + "        delete from allocation_order where allocation_no = #{no}\n"
+                        + "    </delete>\n"
+                        + "</mapper>\n");
+        writeFile("src/main/java/com/ct/scm/service/impl/AllocationOrderServiceImpl.java",
+                "package com.ct.scm.service.impl;\n"
+                        + "public class AllocationOrderServiceImpl {\n"
+                        + "\n"
+                        + "    /**\n"
+                        + "     * 审核\n"
+                        + "     */\n"
+                        + "    @Transactional(rollbackFor = Exception.class)\n"
+                        + "    public void audit(Long id) {\n"
+                        + "        if (id == null) {\n"
+                        + "            return;\n"
+                        + "        }\n"
+                        + "        jdbcTemplate.update(\"insert into inventory_statement(order_id) values (?)\", id);\n"
+                        + "        log.info(\"audit done }\");\n"
+                        + "    }\n"
+                        + "\n"
+                        + "    public void batchAudit(List<Long> ids) {\n"
+                        + "        log.info(\"Data from server\");\n"
+                        + "        ids.forEach(id -> audit(id));\n"
+                        + "    }\n"
+                        + "}\n");
+    }
+
+    private void writeFile(String relativePath, String content) throws IOException {
+        File file = new File(tempRepoDir, relativePath);
+        file.getParentFile().mkdirs();
+        Files.writeString(file.toPath(), content, StandardCharsets.UTF_8);
     }
 
     /**

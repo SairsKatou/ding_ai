@@ -18,6 +18,7 @@ import org.springframework.stereotype.Service;
 import javax.annotation.Resource;
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -26,9 +27,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -67,6 +71,32 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
      * 匹配原因：本地全量源码高亮命中
      */
     private static final String MATCH_REASON_LOCAL_SCAN = "本地全量代码扫描精准命中";
+
+    /**
+     * 单文件代码片段最大字符数，避免个别大文件挤占 Prompt 上下文
+     */
+    private static final int MAX_SNIPPET_CHARS = Constants.FOUR_THOUSAND * Constants.TWO;
+
+    /**
+     * 相关度最高的前 N 个文件片段长度翻倍，保证核心实现类有足够代码
+     */
+    private static final int TOP_SNIPPET_FILES = Constants.THREE;
+
+    /**
+     * 路径命中 Token 的得分加成（相当于内容命中约 e^2 次）
+     */
+    private static final double PATH_HIT_BONUS = 2.0;
+
+    /**
+     * 命中关键词的方法声明行得分加成
+     */
+    private static final double DECLARATION_BOOST = 3.0;
+
+    /**
+     * Java 方法声明行
+     */
+    private static final Pattern METHOD_DECLARATION = Pattern.compile(
+            "^\\s*(?:public|private|protected)\\s+(?:static\\s+)?(?:final\\s+)?[\\w<>\\[\\],.?\\s]+\\s+(\\w+)\\s*\\(");
 
     @Resource
     private YunxiaoProperties yunxiaoProperties;
@@ -168,7 +198,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
         }
 
         Set<String> searchTokens = new HashSet<>(codeSearchKeywordService.buildSearchTokens(searchKeyword, searchKeyword));
-        List<File> matchedFiles = new ArrayList<>();
+        List<FileMatch> matches = new ArrayList<>();
 
         // 1. 毫秒级遍历本地全量文件树
         try (Stream<Path> stream = Files.walk(repoDir.toPath())) {
@@ -180,86 +210,52 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
 
             log.info("本地工程源码文件检索完毕，待扫描源码文件总数: {}", candidates.size());
 
-            // 2. 内存全文扫描匹配
-            for (File file : candidates) {
-                String relativePath = getRelativePath(repoDir, file);
-                boolean pathHit = false;
-                for (String token : searchTokens) {
-                    if (relativePath.toLowerCase().contains(token)) {
-                        pathHit = true;
-                        break;
-                    }
-                }
-
-                if (pathHit) {
-                    matchedFiles.add(file);
-                    continue;
-                }
-
-                // 扫描内容
-                if (fileContainsTokens(file, searchTokens, searchKeyword)) {
-                    matchedFiles.add(file);
-                }
-            }
+            // 2. 内存全文扫描，统计每个 Token 在路径与内容中的命中情况
+            matches = collectMatches(repoDir, candidates, searchTokens);
 
             // 3. 若初次检索未命中任何文件，借助大模型语义推理推断英文 token 进行二次兜底检索
-            if (matchedFiles.isEmpty()) {
+            if (matches.isEmpty()) {
                 Set<String> aiTokens = codeSearchKeywordService.inferEnglishTokensWithAI(searchKeyword);
                 if (CollectionUtils.isNotEmpty(aiTokens)) {
                     log.info("初次扫描未命中，补充大模型推断英文 Token 二次检索: {}", aiTokens);
                     searchTokens.addAll(aiTokens);
-                    for (File file : candidates) {
-                        String relativePath = getRelativePath(repoDir, file);
-                        boolean pathHit = false;
-                        for (String token : aiTokens) {
-                            if (relativePath.toLowerCase().contains(token)) {
-                                pathHit = true;
-                                break;
-                            }
-                        }
-
-                        if (pathHit) {
-                            matchedFiles.add(file);
-                            continue;
-                        }
-
-                        if (fileContainsTokens(file, aiTokens, searchKeyword)) {
-                            matchedFiles.add(file);
-                        }
-                    }
+                    matches = collectMatches(repoDir, candidates, searchTokens);
                 }
             }
         } catch (Exception e) {
             log.error("本地文件扫描异常: {}", e.getMessage(), e);
         }
 
-        log.info("本地全量匹配完成，命中关键词 [{}] 的源码文件总数: {}", searchKeyword, matchedFiles.size());
+        log.info("本地全量匹配完成，命中关键词 [{}] 的源码文件总数: {}", searchKeyword, matches.size());
 
-        // 3. 排序：Controller > Service > Mapper > XML > Entity
-        matchedFiles.sort(Comparator.comparingInt((File f) -> {
-            String path = f.getAbsolutePath().toLowerCase();
-            if (path.contains("controller")) {
-                return Constants.ZERO;
-            }
-            if (path.contains("service")) {
-                return Constants.ONE;
-            }
-            if (path.contains("mapper") || path.endsWith(".xml")) {
-                return Constants.TWO;
-            }
-            return Constants.THREE;
-        }));
+        // 4. 按相关度排序：命中越专属的 Token（如 拆分/spilt）得分越高，泛化 Token（如 statement/bill）得分低；
+        //    同分时路径命中优先，再按 Controller > Service > Mapper/XML > 其他
+        Map<String, Double> tokenWeights = computeTokenWeights(searchTokens, matches);
+        for (FileMatch match : matches) {
+            match.score = scoreMatch(match, tokenWeights);
+        }
+        matches.sort(Comparator.comparingDouble((FileMatch m) -> -m.score)
+                .thenComparing(m -> m.pathTokens.isEmpty())
+                .thenComparingInt(m -> layerOrder(m.relativePath)));
+        if (!matches.isEmpty()) {
+            log.info("相关度最高的文件: {}", matches.stream().limit(Constants.FIVE)
+                    .map(m -> m.relativePath + "(" + String.format("%.1f", m.score) + ")")
+                    .collect(Collectors.joining(", ")));
+        }
 
-        // 4. 提取代码片段
+        // 5. 提取代码片段：相关度最高的前几个文件给予更大的片段长度
         List<YunxiaoCodeSnippetDTO> snippets = new ArrayList<>();
-        int limit = Math.min(matchedFiles.size(), maxFiles);
+        int limit = Math.min(matches.size(), maxFiles);
 
         for (int i = Constants.ZERO; i < limit; i++) {
-            File file = matchedFiles.get(i);
-            String relativePath = getRelativePath(repoDir, file);
+            File file = matches.get(i).file;
+            String relativePath = matches.get(i).relativePath;
             try {
-                String content = Files.readString(file.toPath(), StandardCharsets.UTF_8);
-                String snippet = extractLocalSnippet(content, searchKeyword, searchTokens);
+                String content = readContent(file);
+                // 相关度第 1 的文件通常是核心实现类，给 4 倍长度；第 2~3 个给 2 倍
+                int maxChars = i == Constants.ZERO ? MAX_SNIPPET_CHARS * Constants.FOUR
+                        : (i < TOP_SNIPPET_FILES ? MAX_SNIPPET_CHARS * Constants.TWO : MAX_SNIPPET_CHARS);
+                String snippet = extractLocalSnippet(content, tokenWeights, maxChars);
 
                 snippets.add(YunxiaoCodeSnippetDTO.builder()
                         .filePath(relativePath)
@@ -338,91 +334,247 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     }
 
     /**
-     * 判断文件内容是否包含关键词
+     * 统计每个候选文件在路径与内容中命中的 Token 及次数
      *
-     * @param file          文件
-     * @param searchTokens  衍生 Token 集合
-     * @param originKeyword 原始关键词
-     * @return 是否包含
+     * @param repoDir      仓库根目录
+     * @param candidates   候选文件
+     * @param searchTokens 检索 Token（均为小写）
+     * @return 至少命中一个 Token 的文件
      */
-    private boolean fileContainsTokens(File file, Set<String> searchTokens, String originKeyword) {
-        try (BufferedReader reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.contains(originKeyword)) {
-                    return true;
+    private List<FileMatch> collectMatches(File repoDir, List<File> candidates, Set<String> searchTokens) {
+        List<FileMatch> matches = new ArrayList<>();
+        for (File file : candidates) {
+            String relativePath = getRelativePath(repoDir, file);
+            FileMatch match = new FileMatch(file, relativePath);
+            String lowerPath = relativePath.toLowerCase();
+            String lowerContent;
+            try {
+                lowerContent = readContent(file).toLowerCase();
+            } catch (Exception e) {
+                log.debug("读取本地文件失败, 已跳过: {}", relativePath);
+                continue;
+            }
+            for (String token : searchTokens) {
+                if (lowerPath.contains(token)) {
+                    match.pathTokens.add(token);
                 }
-                String lowerLine = line.toLowerCase();
-                for (String token : searchTokens) {
-                    if (lowerLine.contains(token)) {
-                        return true;
-                    }
+                int count = countOccurrences(lowerContent, token);
+                if (count > Constants.ZERO) {
+                    match.contentCounts.put(token, count);
                 }
             }
-        } catch (Exception ignored) {
+            if (!match.pathTokens.isEmpty() || !match.contentCounts.isEmpty()) {
+                matches.add(match);
+            }
         }
-        return false;
+        return matches;
     }
 
     /**
-     * 提取本地代码上下文片段
+     * 计算 Token 权重（IDF）：命中文件越少的 Token 越专属、权重越高
      *
-     * @param content       完整代码
-     * @param keyword       关键词
-     * @param searchTokens  Token 集合
+     * @param searchTokens 检索 Token
+     * @param matches      命中文件
+     * @return Token -> 权重
+     */
+    private Map<String, Double> computeTokenWeights(Set<String> searchTokens, List<FileMatch> matches) {
+        Map<String, Double> weights = new HashMap<>();
+        for (String token : searchTokens) {
+            long df = matches.stream()
+                    .filter(m -> m.pathTokens.contains(token) || m.contentCounts.containsKey(token))
+                    .count();
+            if (df > Constants.ZERO) {
+                weights.put(token, Math.log(Constants.ONE + (double) matches.size() / df));
+            }
+        }
+        return weights;
+    }
+
+    /**
+     * 文件相关度得分：Σ 权重 × (路径命中加成 + log(1 + 内容命中次数))
+     */
+    private double scoreMatch(FileMatch match, Map<String, Double> tokenWeights) {
+        double score = Constants.ZERO;
+        for (Map.Entry<String, Double> entry : tokenWeights.entrySet()) {
+            String token = entry.getKey();
+            double tf = Math.log(Constants.ONE + match.contentCounts.getOrDefault(token, Constants.ZERO));
+            double pathBonus = match.pathTokens.contains(token) ? PATH_HIT_BONUS : Constants.ZERO;
+            score += entry.getValue() * (pathBonus + tf);
+        }
+        return score;
+    }
+
+    /**
+     * 文本得分：文本中包含的 Token 权重之和
+     */
+    private double scoreText(String lowerText, Map<String, Double> tokenWeights) {
+        double score = Constants.ZERO;
+        for (Map.Entry<String, Double> entry : tokenWeights.entrySet()) {
+            if (lowerText.contains(entry.getKey())) {
+                score += entry.getValue();
+            }
+        }
+        return score;
+    }
+
+    /**
+     * 统计子串出现次数
+     */
+    private int countOccurrences(String text, String token) {
+        if (StringUtils.isEmpty(token)) {
+            return Constants.ZERO;
+        }
+        int count = Constants.ZERO;
+        int index = text.indexOf(token);
+        while (index >= Constants.ZERO) {
+            count++;
+            index = text.indexOf(token, index + token.length());
+        }
+        return count;
+    }
+
+    /**
+     * 按路径判断代码分层：Controller > Service > Mapper/XML > 其他
+     */
+    private int layerOrder(String relativePath) {
+        String path = relativePath.toLowerCase();
+        if (path.contains("controller")) {
+            return Constants.ZERO;
+        }
+        if (path.contains("service")) {
+            return Constants.ONE;
+        }
+        if (path.contains("mapper") || path.endsWith(".xml")) {
+            return Constants.TWO;
+        }
+        return Constants.THREE;
+    }
+
+    /**
+     * 以 UTF-8 读取文件，非法字节按替换字符处理（兼容少量 GBK 文件）
+     */
+    private String readContent(File file) throws IOException {
+        return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 提取本地代码上下文片段：优先截取命中专属 Token 最多的代码行附近，跳过 import/package 行
+     *
+     * @param content      完整代码
+     * @param tokenWeights Token 权重
+     * @param maxChars     片段最大字符数
      * @return 截取后的代码片段
      */
-    private String extractLocalSnippet(String content, String keyword, Set<String> searchTokens) {
+    private String extractLocalSnippet(String content, Map<String, Double> tokenWeights, int maxChars) {
+        String[] lines = content.split("\r?\n");
         if (content.length() <= Constants.FOUR_THOUSAND) {
-            return content;
+            // 短文件保留全文，同样附带行号，保证大模型引用的行号准确
+            List<String> numbered = new ArrayList<>(lines.length);
+            for (int i = Constants.ZERO; i < lines.length; i++) {
+                numbered.add(String.format("L%d: %s", i + Constants.ONE, lines[i]));
+            }
+            return String.join("\n", numbered);
         }
 
-        String[] lines = content.split("\r?\n");
-        Set<Integer> targetLineIndexes = new HashSet<>();
-
+        // 1. 为每个命中行打分：行内命中 Token 的权重之和（import/package 行不计分，避免片段被导包占满）
+        List<Integer> hitLines = new ArrayList<>();
+        double[] lineScores = new double[lines.length];
+        boolean[] declarationHits = new boolean[lines.length];
+        boolean[] importLines = new boolean[lines.length];
         for (int i = Constants.ZERO; i < lines.length; i++) {
-            String line = lines[i];
-            boolean hit = line.contains(keyword);
-            if (!hit) {
-                String lower = line.toLowerCase();
-                for (String token : searchTokens) {
-                    if (lower.contains(token)) {
-                        hit = true;
-                        break;
+            String trimmed = lines[i].trim();
+            if (trimmed.startsWith("import ") || trimmed.startsWith("package ")) {
+                importLines[i] = true;
+                continue;
+            }
+            lineScores[i] = scoreText(lines[i].toLowerCase(), tokenWeights);
+            if (lineScores[i] > Constants.ZERO) {
+                // 方法名命中关键词（如 generateSplitData）通常是业务主干，按方法名计分并优先纳入，
+                // 避免参数类型中的泛化 Token（如 ScmHeadStatementAccountDetail）抬高无关方法
+                Matcher declaration = METHOD_DECLARATION.matcher(lines[i]);
+                if (declaration.find()) {
+                    double nameScore = scoreText(declaration.group(Constants.ONE).toLowerCase(), tokenWeights);
+                    if (nameScore > Constants.ZERO) {
+                        lineScores[i] = nameScore * DECLARATION_BOOST;
+                        declarationHits[i] = true;
                     }
                 }
+                hitLines.add(i);
             }
+        }
 
-            if (hit) {
-                // 取前后各 20 行
-                int start = Math.max(Constants.ZERO, i - Constants.TWENTY);
-                int end = Math.min(lines.length - Constants.ONE, i + Constants.TWENTY);
-                for (int k = start; k <= end; k++) {
-                    targetLineIndexes.add(k);
+        // 2. 按行得分从高到低依次纳入「命中行 ± 15 行」窗口，直到达到长度上限
+        hitLines.sort(Comparator.comparingDouble((Integer i) -> -lineScores[i]));
+        Set<Integer> selected = new TreeSet<>();
+        int selectedChars = Constants.ZERO;
+        boolean truncated = false;
+        for (Integer center : hitLines) {
+            // 方法声明向下多取，覆盖方法体开头的主流程；普通命中行取前后 15 行
+            boolean declaration = declarationHits[center];
+            int start = Math.max(Constants.ZERO, center - (declaration ? Constants.THREE : Constants.FIFTEEN));
+            int end = Math.min(lines.length - Constants.ONE, center + (declaration ? Constants.FIFTY : Constants.FIFTEEN));
+            int windowChars = Constants.ZERO;
+            // 窗口内的 import/package 行同样不纳入
+            for (int k = start; k <= end; k++) {
+                if (!importLines[k] && !selected.contains(k)) {
+                    windowChars += lines[k].length() + Constants.EIGHT;
                 }
             }
-        }
-
-        if (CollectionUtils.isEmpty(targetLineIndexes)) {
-            int limit = Math.min(lines.length, Constants.HUNDRED);
-            return String.join("\n", Arrays.copyOfRange(lines, Constants.ZERO, limit));
-        }
-
-        List<Integer> sorted = new ArrayList<>(targetLineIndexes);
-        Collections.sort(sorted);
-
-        List<String> resultLines = new ArrayList<>();
-        int prev = -Constants.ONE;
-        for (Integer idx : sorted) {
-            if (prev != -Constants.ONE && idx > prev + Constants.ONE) {
-                resultLines.add("// ... [此处省略无关行] ...");
+            if (selectedChars + windowChars > maxChars) {
+                truncated = true;
+                break;
             }
-            // 附带行号，方便架构师级大模型精准分析定位
-            resultLines.add(String.format("L%d: %s", idx + Constants.ONE, lines[idx]));
+            for (int k = start; k <= end; k++) {
+                if (!importLines[k]) {
+                    selected.add(k);
+                }
+            }
+            selectedChars += windowChars;
+        }
+        if (selected.isEmpty()) {
+            // 无行级命中（仅路径命中）时取前 100 行
+            for (int i = Constants.ZERO; i < Math.min(lines.length, Constants.HUNDRED); i++) {
+                selected.add(i);
+            }
+        }
+
+        // 3. 按行号顺序输出，附带行号方便大模型精准定位
+        StringBuilder result = new StringBuilder();
+        int prev = -Constants.ONE;
+        for (Integer idx : selected) {
+            if (prev != -Constants.ONE && idx > prev + Constants.ONE) {
+                result.append("// ... [此处省略无关行] ...\n");
+            }
+            result.append(String.format("L%d: %s", idx + Constants.ONE, lines[idx])).append("\n");
             prev = idx;
         }
+        if (truncated) {
+            result.append("// ... [片段过长已截断，仅保留与关键词最相关的代码] ...");
+        }
+        return result.toString().stripTrailing();
+    }
 
-        return String.join("\n", resultLines);
+    /**
+     * 单个文件的关键词命中情况
+     */
+    private static final class FileMatch {
+
+        private final File file;
+        private final String relativePath;
+        /**
+         * 路径中命中的 Token
+         */
+        private final Set<String> pathTokens = new HashSet<>();
+        /**
+         * 内容中命中的 Token 及次数
+         */
+        private final Map<String, Integer> contentCounts = new HashMap<>();
+        private double score;
+
+        private FileMatch(File file, String relativePath) {
+            this.file = file;
+            this.relativePath = relativePath;
+        }
     }
 
     /**

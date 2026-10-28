@@ -70,12 +70,15 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService {
 
         // 构建系统角色提示词
         String systemPrompt = "你是一名直接参与企业级业务研发的资深 Java 核心开发专家与代码深度探查 Agent。"
-                + "你拥有本地工程的搜索工具（search_files, grep_code, read_file_range）。"
+                + "你拥有本地工程的探查工具（find_table_usages, search_files, grep_code, read_method, get_mapper_sql, read_file_range）。"
                 + "面对用户的问题，你必须像资深程序员一样进行顺藤摸瓜式的多轮探查：\n"
-                + "1. 先用 search_files 模糊搜索匹配的 Entity/Controller/Service/Mapper 文件；\n"
-                + "2. 用 read_file_range 仔细研读核心实体表注解（如 @TableName(\"...\")）、主外键、字段；\n"
-                + "3. 顺着业务调用链，用 grep_code 查找联动表（如库存流水表 statement、明细表 detail、日志表 log、第三方同步表等）；\n"
-                + "4. 探查完毕后，停止调用工具，直接输出一份高密度、清晰分类的表名清单与代码实现深度解析。严禁输出客套套话。";
+                + "1. 先用 find_table_usages 传入英文业务关键词（如 allocation），一次拿到相关表名、实体类及引用位置的全景；\n"
+                + "2. 用 search_files 定位核心 Controller/Service/Mapper 文件，用 read_method 读取关键业务方法的完整方法体，顺着调用链逐层下钻；\n"
+                + "3. 遇到 Mapper 自定义方法时，用 get_mapper_sql 查看 XML 中的完整 SQL，找出联表、子查询中的隐藏表；\n"
+                + "4. 用 grep_code 补充查找联动表（如库存流水表 statement、明细表 detail、日志表 log、第三方同步表等）；"
+                + "read_file_range 仅用于查看字段定义等非方法片段；\n"
+                + "5. 每轮可同时发起多个工具调用以提高效率；信息足够后立即停止调用工具，"
+                + "直接输出一份高密度、清晰分类的表名清单与代码实现深度解析。严禁输出客套套话。";
 
         conversation.add(OpenChatMessageDTO.builder()
                 .role(ROLE_SYSTEM)
@@ -99,9 +102,9 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService {
         Set<String> investigatedFiles = new HashSet<>();
         String finalAnalysis = "";
         int turn = Constants.ZERO;
-        int maxTurns = Constants.FIVE;
+        int maxTurns = Constants.TEN;
 
-        // 2. 多轮 Tool Calling 交互循环 (最多交互 5 轮)
+        // 2. 多轮 Tool Calling 交互循环 (最多交互 10 轮)
         while (turn < maxTurns) {
             turn++;
             log.info("Agent 深度探查第 {}/{} 轮交互开始...", turn, maxTurns);

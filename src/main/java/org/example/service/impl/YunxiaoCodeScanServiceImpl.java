@@ -19,6 +19,7 @@ import org.example.domain.dto.YunxiaoRepositoryDTO;
 import org.example.domain.dto.YunxiaoRepositoryQueryParam;
 import org.example.service.CodeSearchKeywordService;
 import org.example.service.OpenCodeService;
+import org.example.service.YunxiaoAgentToolService;
 import org.example.service.YunxiaoCodeAgentService;
 import org.example.service.YunxiaoCodeScanService;
 import org.example.service.YunxiaoDevopsService;
@@ -99,6 +100,33 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      */
     private static final String MATCH_REASON_CONTENT = "源码文件内容命中业务关键词";
 
+    /**
+     * 本地模式默认 / 最大分析文件数
+     */
+    private static final int LOCAL_MAX_FILES_DEFAULT = Constants.FIFTY;
+    private static final int LOCAL_MAX_FILES_LIMIT = Constants.HUNDRED;
+
+    /**
+     * Prompt 中展示完整代码片段的总字符预算，超出预算的文件只列出路径
+     */
+    private static final int PROMPT_SNIPPET_CHAR_BUDGET = Constants.HUNDRED * Constants.THOUSAND;
+
+    /**
+     * Prompt 中展示完整代码片段的文件数下限，保证即使单文件较大也有足够的代码上下文
+     */
+    private static final int PROMPT_MIN_DETAILED_FILES = Constants.FIVE;
+
+    /**
+     * 表结构类问题中代码片段的字符预算（表名证据已由表引用汇总提供，代码仅作补充）
+     */
+    private static final int TABLE_QUESTION_SNIPPET_CHAR_BUDGET = Constants.TWENTY * Constants.THOUSAND;
+
+    /**
+     * 识别「有几张表 / 涉及哪些表 / 表名」类问题（排除"报表"）
+     */
+    private static final Pattern TABLE_QUESTION_PATTERN = Pattern.compile(
+            "(?<!报)表名|几张(?:数据库)?表|多少张表|(?:哪些|什么|几个)(?:数据库)?表|(?:数据库|业务|相关|核心)表|涉及.{0,6}表|用到.{0,6}表");
+
     @Resource
     private RestTemplate yunxiaoRestTemplate;
 
@@ -116,6 +144,9 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
 
     @Resource
     private CodeSearchKeywordService codeSearchKeywordService;
+
+    @Resource
+    private YunxiaoAgentToolService yunxiaoAgentToolService;
 
     @Resource
     private YunxiaoCodeAgentService yunxiaoCodeAgentService;
@@ -148,11 +179,11 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         String branch = param.getBranch().trim();
         String question = param.getQuestion().trim();
 
-        // 确定关键词与最大扫描文件数：本地分析最大 500，远程分析最大 30
+        // 确定关键词与最大扫描文件数：本地分析默认 50、最大 100，远程分析最大 30
         String searchKeyword = codeSearchKeywordService.resolveCoreKeyword(param.getKeyword(), question);
         int localMaxFiles = param.getMaxFiles() != null && param.getMaxFiles() > Constants.ZERO
-                ? Math.min(param.getMaxFiles(), Constants.FIVE_HUNDRED)
-                : Constants.FIVE_HUNDRED;
+                ? Math.min(param.getMaxFiles(), LOCAL_MAX_FILES_LIMIT)
+                : LOCAL_MAX_FILES_DEFAULT;
         int remoteMaxFiles = param.getMaxFiles() != null && param.getMaxFiles() > Constants.ZERO
                 ? Math.min(param.getMaxFiles(), Constants.THIRTY)
                 : Constants.THIRTY;
@@ -161,11 +192,14 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 actualRepoName, actualRepoId, branch, searchKeyword, question, localMaxFiles, remoteMaxFiles);
 
         List<YunxiaoCodeSnippetDTO> matchedSnippets = new ArrayList<>();
-        String cloneUrl = StringUtils.isNotBlank(targetRepo.getHttpUrlToRepo())
+        // 表结构类问题：额外汇总「表名 → 实体 → 引用位置」作为一手证据，并使用简洁输出格式
+        boolean tableQuestion = isTableQuestion(question);
+        String tableSummary = null;
+        String cloneUrl =StringUtils.isNotBlank(targetRepo.getHttpUrlToRepo())
                 ? targetRepo.getHttpUrlToRepo()
                 : (StringUtils.isNotBlank(targetRepo.getWebUrl()) ? targetRepo.getWebUrl() + ".git" : "");
 
-        // 优先采用【方案 A】：本地 Git 浅克隆缓存策略（保留 2 小时，本地毫秒级全量扫描，最大分析 500 个文件）
+        // 优先采用【方案 A】：本地 Git 浅克隆缓存策略（保留 2 小时，本地毫秒级全量扫描，默认分析 50 个文件、最大 100 个）
         boolean planASuccess = false;
         if (StringUtils.isNotBlank(cloneUrl)) {
             try {
@@ -179,6 +213,9 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 }
 
                 matchedSnippets = yunxiaoGitCloneService.scanLocalRepository(localRepoDir, searchKeyword, localMaxFiles);
+                if (tableQuestion) {
+                    tableSummary = buildTableSummary(localRepoDir, searchKeyword);
+                }
                 planASuccess = true;
                 log.info("【方案 A 成功】本地全量扫描完成，命中核心代码片段数: {} (最大上限: {})", matchedSnippets.size(), localMaxFiles);
             } catch (Exception e) {
@@ -194,7 +231,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
             matchedSnippets = extractMatchedSnippets(actualRepoId, branch, candidateFiles, searchKeyword, remoteMaxFiles);
         }
 
-        if (CollectionUtils.isEmpty(matchedSnippets)) {
+        if (CollectionUtils.isEmpty(matchedSnippets) && StringUtils.isBlank(tableSummary)) {
             String emptyReport = String.format("未能在此分支 [%s] 的代码中检索到与「%s」直接相关的代码片段。\n建议核对分支名称或提问关键词是否正确。",
                     branch, searchKeyword);
             return YunxiaoCodeScanResultDTO.builder()
@@ -209,7 +246,9 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         }
 
         // 5. 组装专业的代码审计 Prompt 并调用 OpenCode 大模型
-        List<OpenChatMessageDTO> messages = buildPromptMessages(actualRepoName, actualRepoId, branch, question, searchKeyword, matchedSnippets);
+        List<OpenChatMessageDTO> messages = tableQuestion
+                ? buildTablePromptMessages(actualRepoName, branch, question, searchKeyword, tableSummary, matchedSnippets)
+                : buildPromptMessages(actualRepoName, actualRepoId, branch, question, searchKeyword, matchedSnippets);
         log.info("准备调用 OpenCode 大模型进行分支代码梳理分析...");
         String analysisReport = openCodeService.chat(messages);
 
@@ -724,7 +763,8 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         // System 角色设定：直给型资深架构师，杜绝客套套话与冗余概念
         String systemContent = "你是一名直接参与企业级业务研发的资深 Java 核心开发专家。"
                 + "请抛弃任何客套话、宏观业务定义和模板化套话，直接给出高密度、最贴近实际工程代码的精准梳理。"
-                + "从接口入口到核心实现层层拆解，必须标明具体的代码类名、方法名、代码行号区间、字段名、判断条件及边界处理。";
+                + "聚焦 Service/Mapper 中的核心业务实现层层拆解，必须标明具体的代码类名、方法名、代码行号区间、字段名、判断条件及边界处理。"
+                + "Controller 只作为触发入口一笔带过，不评论接口规范。";
         messages.add(OpenChatMessageDTO.builder()
                 .role(ROLE_SYSTEM)
                 .content(systemContent)
@@ -739,24 +779,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         sb.append("- 分析诉求: ").append(question).append("\n\n");
 
         sb.append("【命中源码上下文（共 ").append(matchedSnippets.size()).append(" 个代码文件，源码带行号）】\n\n");
-
-        // 限制放入 Prompt 的详细代码块数量（最多前 20 个高优先级文件展示完整核心代码切片，其余列出文件路径清单）
-        int detailedLimit = Math.min(matchedSnippets.size(), Constants.TWENTY);
-        for (int i = Constants.ZERO; i < detailedLimit; i++) {
-            YunxiaoCodeSnippetDTO snippet = matchedSnippets.get(i);
-            sb.append("### 文件 ").append(i + Constants.ONE).append(": `").append(snippet.getFilePath()).append("`\n");
-            sb.append("```java\n");
-            sb.append(snippet.getSnippet());
-            sb.append("\n```\n\n");
-        }
-
-        if (matchedSnippets.size() > detailedLimit) {
-            sb.append("### 其余命中关键词的代码文件清单（共 ").append(matchedSnippets.size() - detailedLimit).append(" 个文件）：\n");
-            for (int i = detailedLimit; i < matchedSnippets.size(); i++) {
-                sb.append("- `").append(matchedSnippets.get(i).getFilePath()).append("`\n");
-            }
-            sb.append("\n");
-        }
+        appendSnippets(sb, matchedSnippets, PROMPT_SNIPPET_CHAR_BUDGET);
 
         sb.append("【输出格式硬性要求与参考样例】\n");
         sb.append("请严格遵循以下高密度输出结构，不要输出任何引言、客套话或模板套话：\n\n");
@@ -793,10 +816,16 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         sb.append("- 金额错误文案写的是「预计费用」，实为实报金额。\n");
         sb.append("=== 格式示范结束 ===\n\n");
         sb.append("【本次梳理要求】\n");
-        sb.append("1. **第一句直奔主题**：指明入口方法（如 {Controller}.{method}（{HTTP Method} {Path}，{注解}）），核心实现见 {ServiceImpl}.java:{lineStart}-{lineEnd}。并说明流程或逻辑分几层/几步。\n");
-        sb.append("2. **结构化分层拆解**：根据源码执行流依次分点阐述（如 DTO 注解校验、前置校验、数据库查重、事务/并发/状态流转等），必须精确写出具体的方法名、文件行号、字段名、判定条件、状态值、错误提示、关联 SQL/Redis 条件，禁止泛化套话。\n");
-        sb.append("3. **可留意的点**：最后精炼列出边界特例、潜在坑点、代码设计不一致或缺陷等。\n");
+        sb.append("1. **第一句直奔主题**：说明核心逻辑集中在 {ServiceImpl}.{method}（:{行号}），结果写入哪张表/用于什么，并说明分几步。\n");
+        sb.append("2. **结构化分层拆解**：按业务执行流分点阐述（如 触发场景、读取的配置、分组维度、计算/分摊/匹配规则、聚合与落库、下游使用），"
+                + "必须精确写出具体的方法名、文件行号、字段名、判定条件、状态值、报错条件、关联 SQL/Redis 条件，禁止泛化套话。"
+                + "触发入口只用一行列出（含 Controller 接口与内部调用处），不展开 Controller 的注解、参数与返回值。\n");
+        sb.append("3. **可留意的点**：只写业务逻辑上的特例与坑点，最多 3 条，没有就不写。"
+                + "不要评论接口规范（GET/POST、权限注解、@Log、参数校验、返回值类型、方法命名拼写），除非问题明确问到。\n");
         sb.append("4. **直接输出上述内容，严禁任何寒暄、问候、总结前言或后记**。\n");
+        sb.append("6. **源码不足时**：若核心方法体不在上述源码中，用一句话说明缺少哪个类的哪个方法，不要用 Controller 细节或推测填充篇幅。\n");
+        sb.append("5. **篇幅与问题匹配**：若问题只是询问简单事实（如有哪些状态、字段、类型、枚举值），直接用列表或表格给出答案并附出处文件，"
+                + "不必套用上述分层结构与「可留意的点」。\n");
 
         messages.add(OpenChatMessageDTO.builder()
                 .role(ROLE_USER)
@@ -804,6 +833,135 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 .build());
 
         return messages;
+    }
+
+    /**
+     * 组装表结构类问题的 Prompt：以表引用汇总为一手证据，要求简洁表格式输出
+     *
+     * @param repoName        项目名
+     * @param branch          分支名
+     * @param question        用户提问
+     * @param searchKeyword   搜索关键词
+     * @param tableSummary    表引用汇总（可能为空）
+     * @param matchedSnippets 命中的代码片段
+     * @return Prompt 消息列表
+     */
+    private List<OpenChatMessageDTO> buildTablePromptMessages(String repoName, String branch, String question,
+                                                              String searchKeyword, String tableSummary,
+                                                              List<YunxiaoCodeSnippetDTO> matchedSnippets) {
+        List<OpenChatMessageDTO> messages = new ArrayList<>();
+        messages.add(OpenChatMessageDTO.builder()
+                .role(ROLE_SYSTEM)
+                .content("你是熟悉该工程的资深 Java 开发。回答简洁直接：先给结论，再给表格，不展开代码实现。"
+                        + "表名必须来自给出的源码证据（@TableName、SQL、BaseMapper 等），严禁编造或按类名臆测。")
+                .build());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("【背景】代码库 ").append(repoName).append("，分支 ").append(branch)
+                .append("，关键词「").append(searchKeyword).append("」\n");
+        sb.append("【问题】").append(question).append("\n\n");
+
+        if (StringUtils.isNotBlank(tableSummary)) {
+            sb.append("【表引用汇总（一手证据，表名以此为准）】\n").append(tableSummary).append("\n");
+        }
+        if (CollectionUtils.isNotEmpty(matchedSnippets)) {
+            sb.append("【相关源码（补充参考）】\n\n");
+            appendSnippets(sb, matchedSnippets, TABLE_QUESTION_SNIPPET_CHAR_BUDGET);
+        }
+
+        sb.append("【输出要求】\n");
+        sb.append("1. 第一行直接给结论：「{业务模块}有 N 张核心表：」。\n");
+        sb.append("2. 用 Markdown 表格列出核心表，两列：表名 | 作用（一句话，20 字以内，可括注关键字段）。"
+                + "核心表指表名或实体类直接属于该业务的表，主表在前、子表在后。\n");
+        sb.append("3. 若证据显示该业务还会写入公共表（如应付单、附件、操作日志），表格后用一行「另外还会间接写到公共表：」列出，每张表括注一句原因；"
+                + "供应商、公司、字典、配置等只读基础档案表不要列。\n");
+        sb.append("4. 全文控制在 15 行以内。不要写代码实现、行号、调用链、Controller 接口和风险点，除非问题明确要求。\n");
+        sb.append("5. 不要任何寒暄、前言或总结。\n\n");
+        sb.append("示例：\n");
+        sb.append("调拨单模块有 2 张核心表：\n\n");
+        sb.append("| 表名 | 作用 |\n|---|---|\n");
+        sb.append("| allocation_order | 调拨单主表（单号、调出/调入仓、状态） |\n");
+        sb.append("| allocation_order_detail | 调拨明细（SKU、调拨数量） |\n\n");
+        sb.append("另外还会间接写到公共表：inventory_statement（调拨出入库时记库存流水）。\n");
+
+        messages.add(OpenChatMessageDTO.builder()
+                .role(ROLE_USER)
+                .content(sb.toString())
+                .build());
+        return messages;
+    }
+
+    /**
+     * 按字符预算拼接代码片段：至少展示前 5 个文件，超出预算的文件只列出路径
+     *
+     * @param sb         目标文本
+     * @param snippets   代码片段
+     * @param charBudget 字符预算
+     */
+    private void appendSnippets(StringBuilder sb, List<YunxiaoCodeSnippetDTO> snippets, int charBudget) {
+        int detailedLimit = Constants.ZERO;
+        int usedChars = Constants.ZERO;
+        for (YunxiaoCodeSnippetDTO snippet : snippets) {
+            int snippetChars = StringUtils.length(snippet.getSnippet());
+            if (detailedLimit >= PROMPT_MIN_DETAILED_FILES && usedChars + snippetChars > charBudget) {
+                break;
+            }
+            usedChars += snippetChars;
+            detailedLimit++;
+        }
+        for (int i = Constants.ZERO; i < detailedLimit; i++) {
+            YunxiaoCodeSnippetDTO snippet = snippets.get(i);
+            sb.append("### 文件 ").append(i + Constants.ONE).append(": `").append(snippet.getFilePath()).append("`\n");
+            sb.append("```java\n");
+            sb.append(snippet.getSnippet());
+            sb.append("\n```\n\n");
+        }
+
+        if (snippets.size() > detailedLimit) {
+            sb.append("### 其余命中关键词的代码文件清单（共 ").append(snippets.size() - detailedLimit).append(" 个文件）：\n");
+            for (int i = detailedLimit; i < snippets.size(); i++) {
+                sb.append("- `").append(snippets.get(i).getFilePath()).append("`\n");
+            }
+            sb.append("\n");
+        }
+    }
+
+    /**
+     * 判断是否为表结构类问题（如「实报费用有几张表」「调拨涉及哪些表」）
+     *
+     * @param question 用户提问
+     * @return 是否为表结构类问题
+     */
+    private boolean isTableQuestion(String question) {
+        return StringUtils.isNotBlank(question) && TABLE_QUESTION_PATTERN.matcher(question).find();
+    }
+
+    /**
+     * 借助 find_table_usages 汇总业务相关表，作为表结构类问题的一手证据
+     *
+     * @param repoDir       本地仓库目录
+     * @param searchKeyword 业务关键词
+     * @return 表引用汇总文本，无英文检索词或检索失败时返回 null
+     */
+    private String buildTableSummary(File repoDir, String searchKeyword) {
+        // 表名均为英文：优先选用带下划线的表名形态 Token（如 actual_reimbursement），其次取最长的英文 Token
+        String tableKeyword = buildSearchTokens(searchKeyword).stream()
+                .filter(token -> token.matches("[a-z][a-z0-9_]{2,}"))
+                .max(Comparator.comparing((String token) -> token.contains("_")).thenComparingInt(String::length))
+                .orElse(null);
+        if (tableKeyword == null) {
+            log.info("关键词 [{}] 未能映射到英文表名检索词，跳过表引用汇总", searchKeyword);
+            return null;
+        }
+        try {
+            String summary = yunxiaoAgentToolService.executeTool("find_table_usages",
+                    JSON.toJSONString(Collections.singletonMap("keyword", tableKeyword)), repoDir);
+            log.info("表结构类问题，按 [{}] 汇总表引用完成，长度: {}", tableKeyword, StringUtils.length(summary));
+            return summary;
+        } catch (Exception e) {
+            log.warn("表引用汇总异常, keyword: {}, error: {}", tableKeyword, e.getMessage());
+            return null;
+        }
     }
 
     /**

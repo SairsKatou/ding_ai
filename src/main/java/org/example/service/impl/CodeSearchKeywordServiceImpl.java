@@ -38,7 +38,7 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
 
     // 后置疑问及泛化询问句式模式
     private static final Pattern SUFFIX_PATTERN = Pattern.compile(
-            "(?:涉及的表名是哪些|涉及的表名有哪些|涉及的表是哪些|涉及哪些表|涉及的表有哪些|涉及的表|用到了哪些表|用到了什么表|对应哪些表|对应什么表|相关的表|相关的数据库表|相关表|表名是哪些|表名有哪些|有哪些表名|有哪些状态|状态有哪些|状态是哪些|是什么状态|有哪些字段|字段有哪些|字段是哪些|有哪些类型|类型有哪些|类型是哪些|使用的地方|在哪些地方用到了|的具体实现|相关的代码|的核心代码|的代码在哪里|的代码|的核心逻辑|的逻辑|的使用情况|使用情况|的流程|有哪些校验|校验逻辑有哪些|的校验逻辑|的校验|是怎么实现的|怎么实现的|是怎么处理的|怎么处理的|是怎么写的|怎么写的|怎么做的|怎么算|是怎么算的|是什么|是哪些|有哪些)+[?？!！。\\s]*$"
+            "(?:有几张数据库表|有几张表|有多少张表|有多少表|几张表|多少张表|共有几张表|涉及的表名是哪些|涉及的表名有哪些|涉及的表是哪些|涉及哪些表|涉及的表有哪些|涉及的表|用到了哪些表|用到了什么表|对应哪些表|对应什么表|相关的表|相关的数据库表|相关表|表名是哪些|表名有哪些|有哪些表名|有哪些状态|状态有哪些|状态是哪些|是什么状态|有哪些字段|字段有哪些|字段是哪些|有哪些类型|类型有哪些|类型是哪些|使用的地方|在哪些地方用到了|的具体实现|相关的代码|的核心代码|的代码在哪里|的代码|的核心逻辑|的逻辑|的使用情况|使用情况|的流程|有哪些校验|校验逻辑有哪些|的校验逻辑|的校验|是怎么实现的|怎么实现的|是怎么处理的|怎么处理的|是怎么写的|怎么写的|怎么做的|怎么算|是怎么算的|是什么|是哪些|有哪些|逻辑|流程|规则|实现|机制)+[?？!！。\\s]*$"
     );
 
     // 常用电商与供应链业务中英文对照表
@@ -70,6 +70,12 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
         BUSINESS_DICT.put("头程账单", Arrays.asList("headbill", "head_bill", "firstleg"));
         BUSINESS_DICT.put("账单", Arrays.asList("bill", "statement", "reconciliation"));
         BUSINESS_DICT.put("对账", Arrays.asList("reconciliation", "bill", "statement"));
+        BUSINESS_DICT.put("对账单", Arrays.asList("statement", "statementaccount", "statement_account", "reconciliation"));
+
+        // 拆分 / 分摊 / 明细（工程中存在 spilt 拼写，需同时覆盖）
+        BUSINESS_DICT.put("拆分", Arrays.asList("split", "spilt"));
+        BUSINESS_DICT.put("分摊", Arrays.asList("share", "apportion", "allocate"));
+        BUSINESS_DICT.put("明细", Arrays.asList("detail"));
 
         // 采购
         BUSINESS_DICT.put("采购", Arrays.asList("purchase", "purchaseorder", "purchase_order", "payable", "caigou"));

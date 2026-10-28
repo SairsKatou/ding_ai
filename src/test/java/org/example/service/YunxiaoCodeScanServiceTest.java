@@ -4,6 +4,7 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.ct.common.core.constant.Constants;
 import org.example.config.YunxiaoProperties;
+import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.YunxiaoCodeScanInstructionDTO;
 import org.example.domain.dto.YunxiaoCodeScanParam;
 import org.example.domain.dto.YunxiaoCodeScanResultDTO;
@@ -14,6 +15,7 @@ import org.example.service.impl.YunxiaoCodeScanServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -32,6 +34,7 @@ import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -68,6 +71,9 @@ public class YunxiaoCodeScanServiceTest {
     @Mock
     private YunxiaoCodeAgentService yunxiaoCodeAgentService;
 
+    @Mock
+    private YunxiaoAgentToolService yunxiaoAgentToolService;
+
     private YunxiaoProperties yunxiaoProperties;
 
     @BeforeEach
@@ -84,6 +90,48 @@ public class YunxiaoCodeScanServiceTest {
         ReflectionTestUtils.setField(yunxiaoCodeScanService, "yunxiaoGitCloneService", yunxiaoGitCloneService);
         ReflectionTestUtils.setField(yunxiaoCodeScanService, "codeSearchKeywordService", new CodeSearchKeywordServiceImpl());
         ReflectionTestUtils.setField(yunxiaoCodeScanService, "yunxiaoCodeAgentService", yunxiaoCodeAgentService);
+        ReflectionTestUtils.setField(yunxiaoCodeScanService, "yunxiaoAgentToolService", yunxiaoAgentToolService);
+    }
+
+    /**
+     * 测试「有几张表」类问题：注入表引用汇总，并使用简洁表格式 Prompt
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testScanAndAnalyzeBranchTableQuestion() {
+        YunxiaoRepositoryDTO mockRepo = YunxiaoRepositoryDTO.builder()
+                .id(6120951L)
+                .name("changtai-cloud")
+                .httpUrlToRepo("https://codeup.aliyun.com/mock/changtai-cloud.git")
+                .build();
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.singletonList(mockRepo));
+        when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new File("."));
+        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyInt()))
+                .thenReturn(Collections.emptyList());
+        when(yunxiaoAgentToolService.executeTool(eq("find_table_usages"), anyString(), any(File.class)))
+                .thenReturn("■ scm_actual_reimbursement  实体: ScmActualReimbursement  (引用 3 处)\n");
+        when(openCodeService.chat(anyList())).thenReturn("实报费用模块有 3 张核心表：");
+
+        YunxiaoCodeScanParam param = YunxiaoCodeScanParam.builder()
+                .repositoryId("changtai-cloud")
+                .branch("dev")
+                .question("关于实报费用有几张表")
+                .build();
+        YunxiaoCodeScanResultDTO result = yunxiaoCodeScanService.scanAndAnalyzeBranch(param);
+
+        assertEquals("实报费用模块有 3 张核心表：", result.getAnalysisReport());
+        // 按带下划线的表名形态检索
+        verify(yunxiaoAgentToolService).executeTool(eq("find_table_usages"),
+                eq("{\"keyword\":\"actual_reimbursement\"}"), any(File.class));
+
+        ArgumentCaptor<List<OpenChatMessageDTO>> captor = ArgumentCaptor.forClass(List.class);
+        verify(openCodeService).chat(captor.capture());
+        String userPrompt = captor.getValue().get(Constants.ONE).getContent();
+        assertTrue(userPrompt.contains("scm_actual_reimbursement"));
+        assertTrue(userPrompt.contains("15 行以内"));
+        // 不再套用「校验逻辑」长篇分层模板
+        assertFalse(userPrompt.contains("结构化分层拆解"));
     }
 
     /**
@@ -186,7 +234,7 @@ public class YunxiaoCodeScanServiceTest {
         assertEquals("dev", result.getBranch());
         assertEquals(Constants.ONE, result.getMatchedFileCount());
         assertTrue(result.getAnalysisReport().contains("方案A本地扫描大模型审计报告"));
-        verify(yunxiaoGitCloneService).scanLocalRepository(any(File.class), anyString(), eq(Constants.FIVE_HUNDRED));
+        verify(yunxiaoGitCloneService).scanLocalRepository(any(File.class), anyString(), eq(Constants.FIFTY));
     }
 
     /**

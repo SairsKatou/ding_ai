@@ -62,6 +62,18 @@ public class CodeSearchKeywordServiceTest {
         // 测试显式指定关键词时优先使用
         String keyword5 = codeSearchKeywordService.resolveCoreKeyword("allocation", "调拨单涉及的表名是哪些");
         assertEquals("allocation", keyword5);
+
+        // 测试提炼“关于实报费用有几张表”
+        String keyword6 = codeSearchKeywordService.resolveCoreKeyword(null, "关于实报费用有几张表");
+        assertEquals("实报费用", keyword6);
+
+        // 测试提炼“对账单明细拆分逻辑”，并覆盖 spilt 拼写
+        String keyword7 = codeSearchKeywordService.resolveCoreKeyword(null, "对账单明细拆分逻辑");
+        assertEquals("对账单明细拆分", keyword7);
+        Set<String> tokens = codeSearchKeywordService.buildSearchTokens(keyword7, keyword7);
+        assertTrue(tokens.contains("拆分"));
+        assertTrue(tokens.contains("spilt"));
+        assertTrue(tokens.contains("statement_account"));
     }
 
     /**

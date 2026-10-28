@@ -48,9 +48,9 @@ public class YunxiaoCodeScanParam implements Serializable {
     private String keyword;
 
     /**
-     * 参与扫描分析的最大代码文件数（本地模式最大 500，远程模式最大 30）
+     * 参与扫描分析的最大代码文件数（本地模式默认 50、最大 100，远程模式最大 30）
      */
-    @ApiModelProperty(value = "最大分析文件数（本地模式最大 500，远程模式最大 30）", example = "500")
+    @ApiModelProperty(value = "最大分析文件数（本地模式默认 50、最大 100，远程模式最大 30）", example = "50")
     private Integer maxFiles;
 
     /**
