@@ -117,4 +117,59 @@ public class YunxiaoAgentToolServiceTest {
         assertTrue(output.contains("AllocationOrder"));
         assertTrue(output.contains("1:"));
     }
+
+    /**
+     * 测试 read_file_range 拒绝 ../ 路径穿越
+     */
+    @Test
+    public void testExecuteToolReadFileRangeRejectsPathTraversal() throws IOException {
+        File outsideFile = new File(tempRepoDir.getParentFile(), tempRepoDir.getName() + "-secret.java");
+        Files.writeString(outsideFile.toPath(), "secret", StandardCharsets.UTF_8);
+        try {
+            String args = "{\"file_path\":\"../" + outsideFile.getName() + "\"}";
+            String output = yunxiaoAgentToolService.executeTool("read_file_range", args, tempRepoDir);
+
+            assertTrue(output.contains("越界"));
+            assertFalse(output.contains("secret\n"));
+        } finally {
+            outsideFile.delete();
+        }
+    }
+
+    /**
+     * 测试 read_file_range 标题按实际读取到的结束行号展示
+     */
+    @Test
+    public void testExecuteToolReadFileRangeActualEndLine() {
+        String args = "{\"file_path\":\"src/main/java/com/ct/scm/entity/AllocationOrder.java\",\"line_count\":50}";
+        String output = yunxiaoAgentToolService.executeTool("read_file_range", args, tempRepoDir);
+
+        assertTrue(output.contains("(行 1-7)"));
+    }
+
+    /**
+     * 测试排除目录下的文件不会被检索
+     */
+    @Test
+    public void testExecuteToolSkipsExcludedDirs() throws IOException {
+        File targetDir = new File(tempRepoDir, "target/classes");
+        targetDir.mkdirs();
+        Files.writeString(new File(targetDir, "AllocationOrderCopy.java").toPath(), "allocation_order", StandardCharsets.UTF_8);
+
+        String output = yunxiaoAgentToolService.executeTool("search_files", "{\"pattern\":\"Allocation\"}", tempRepoDir);
+
+        assertTrue(output.contains("AllocationOrder.java"));
+        assertFalse(output.contains("AllocationOrderCopy.java"));
+    }
+
+    /**
+     * 测试非法 JSON 入参与空工具名称
+     */
+    @Test
+    public void testExecuteToolInvalidInput() {
+        assertTrue(yunxiaoAgentToolService.executeTool("grep_code", "{bad json", tempRepoDir).contains("JSON"));
+        assertTrue(yunxiaoAgentToolService.executeTool(null, "{}", tempRepoDir).contains("工具名称不能为空"));
+        assertTrue(yunxiaoAgentToolService.executeTool("read_file_range",
+                "{\"file_path\":\"a.java\",\"start_line\":\"abc\"}", tempRepoDir).contains("异常"));
+    }
 }
