@@ -4,6 +4,7 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.ct.common.core.constant.Constants;
 import org.example.config.YunxiaoProperties;
+import org.example.domain.dto.CodeAgentAnalysisDTO;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.YunxiaoCodeScanInstructionDTO;
 import org.example.domain.dto.YunxiaoCodeScanParam;
@@ -287,6 +288,50 @@ public class YunxiaoCodeScanServiceTest {
         assertTrue(userPrompt.contains("结构骨架"));
         assertFalse(userPrompt.contains("preCheckReimbursement"));
         assertFalse(userPrompt.contains("checkDatabaseDuplicatesBatch"));
+    }
+
+    /**
+     * 测试普通扫描本地模式：预检索片段 + 最多 3 轮工具调用，不再单独调用一次性 chat；Agent 读取的文件计入结果
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testQuickScanUsesAgentWithThreeTurns() {
+        YunxiaoRepositoryDTO mockRepo = YunxiaoRepositoryDTO.builder()
+                .id(6120951L)
+                .name("changtai-cloud")
+                .httpUrlToRepo("https://codeup.aliyun.com/mock/changtai-cloud.git")
+                .build();
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.singletonList(mockRepo));
+        when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new File("."));
+        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyString(), anyInt()))
+                .thenReturn(Collections.singletonList(YunxiaoCodeSnippetDTO.builder()
+                        .filePath("service/DemoServiceImpl.java")
+                        .snippet("L1: class DemoServiceImpl {}")
+                        .build()));
+        when(yunxiaoCodeAgentService.analyzeWithTools(anyList(), any(File.class), eq(Constants.THREE)))
+                .thenReturn(CodeAgentAnalysisDTO.builder()
+                        .report("Agent 报告")
+                        .readFiles(List.of("service/DemoValidator.java"))
+                        .build());
+
+        YunxiaoCodeScanParam param = YunxiaoCodeScanParam.builder()
+                .repositoryId("changtai-cloud")
+                .branch("dev")
+                .question("梳理调拨单新增的校验逻辑")
+                .build();
+        YunxiaoCodeScanResultDTO result = yunxiaoCodeScanService.scanAndAnalyzeBranch(param);
+
+        assertEquals("Agent 报告", result.getAnalysisReport());
+        assertEquals(List.of("service/DemoServiceImpl.java", "service/DemoValidator.java"), result.getMatchedFiles());
+        assertEquals(Constants.TWO, result.getMatchedFileCount());
+        verify(openCodeService, never()).chat(anyList());
+
+        ArgumentCaptor<List<OpenChatMessageDTO>> captor = ArgumentCaptor.forClass(List.class);
+        verify(yunxiaoCodeAgentService).analyzeWithTools(captor.capture(), any(File.class), eq(Constants.THREE));
+        String userPrompt = captor.getValue().get(Constants.ONE).getContent();
+        assertTrue(userPrompt.contains("【可用工具】"));
+        assertTrue(userPrompt.contains("最多 2 轮"));
     }
 
     /**

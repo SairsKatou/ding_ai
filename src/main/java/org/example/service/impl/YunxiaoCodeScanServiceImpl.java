@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.example.config.YunxiaoProperties;
+import org.example.domain.dto.CodeAgentAnalysisDTO;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.YunxiaoCodeFileBlobDTO;
 import org.example.domain.dto.YunxiaoCodeFileTreeDTO;
@@ -126,6 +127,11 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      * 降级提示中错误原因的最大长度
      */
     private static final int MAX_DEGRADE_REASON_CHARS = Constants.TWO_HUNDRED;
+
+    /**
+     * 普通代码扫描最多大模型调用轮数（前 2 轮可调用工具补充源码，第 3 轮强制输出结论）
+     */
+    private static final int QUICK_SCAN_MAX_TURNS = Constants.THREE;
 
     @Resource
     private RestTemplate yunxiaoRestTemplate;
@@ -270,11 +276,26 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         List<OpenChatMessageDTO> messages = tableQuestion
                 ? buildTablePromptMessages(actualRepoName, branch, question, searchKeyword, tableSummary, matchedSnippets)
                 : buildPromptMessages(actualRepoName, actualRepoId, branch, question, searchKeyword, matchedSnippets);
-        log.info("准备调用 OpenCode 大模型进行分支代码梳理分析...");
-        String analysisReport = openCodeService.chat(messages);
         List<String> matchedFilePaths = matchedSnippets.stream()
                 .map(YunxiaoCodeSnippetDTO::getFilePath)
-                .collect(Collectors.toList());
+                .collect(Collectors.toCollection(ArrayList::new));
+        String analysisReport = null;
+        if (planASuccess) {
+            // 本地克隆可用：以预检索片段为首轮上下文，允许大模型用工具补充源码，最多 QUICK_SCAN_MAX_TURNS 轮
+            log.info("准备调用 OpenCode 大模型进行分支代码梳理分析（最多 {} 轮工具调用）...", QUICK_SCAN_MAX_TURNS);
+            CodeAgentAnalysisDTO agentResult = yunxiaoCodeAgentService.analyzeWithTools(
+                    appendToolUsageHint(messages), localRepoDir, QUICK_SCAN_MAX_TURNS);
+            if (agentResult != null && StringUtils.isNotBlank(agentResult.getReport())) {
+                analysisReport = agentResult.getReport();
+                agentResult.getReadFiles().stream()
+                        .filter(path -> !matchedFilePaths.contains(path))
+                        .forEach(matchedFilePaths::add);
+            }
+        }
+        if (analysisReport == null) {
+            log.info("准备调用 OpenCode 大模型进行分支代码梳理分析...");
+            analysisReport = openCodeService.chat(messages);
+        }
         if (planASuccess) {
             analysisReport = CodeCitationVerifier.appendWarnings(analysisReport, localRepoDir, matchedFilePaths);
         }
@@ -285,7 +306,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 .repositoryName(actualRepoName)
                 .branch(branch)
                 .question(question)
-                .matchedFileCount(matchedSnippets.size())
+                .matchedFileCount(matchedFilePaths.size())
                 .matchedFiles(matchedFilePaths)
                 .analysisReport(analysisReport)
                 .build();
@@ -940,6 +961,24 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      */
     private boolean isTableQuestion(String question) {
         return codeSearchKeywordService.isTableQuestion(question);
+    }
+
+    /**
+     * 在最后一条用户消息末尾追加工具使用说明（返回新列表，不修改原消息，原消息仍用于一次性调用兜底）
+     */
+    private List<OpenChatMessageDTO> appendToolUsageHint(List<OpenChatMessageDTO> messages) {
+        List<OpenChatMessageDTO> result = new ArrayList<>(messages);
+        int last = result.size() - Constants.ONE;
+        OpenChatMessageDTO lastMessage = result.get(last);
+        result.set(last, OpenChatMessageDTO.builder()
+                .role(lastMessage.getRole())
+                .content(lastMessage.getContent() + "\n\n【可用工具】上方源码是预先检索的片段，可能不完整。"
+                        + "若回答所需的方法体、被调用方法、Mapper SQL 或调用方不在片段中，可调用 read_method、list_methods、"
+                        + "find_callers、get_mapper_sql 等工具补充读取，最多 " + (QUICK_SCAN_MAX_TURNS - Constants.ONE)
+                        + " 轮，之后必须直接输出结论；片段已足够时请直接回答，不要调用工具。"
+                        + "工具读取到的代码同样按「文件名.java:行号」引用。")
+                .build());
+        return result;
     }
 
     /**

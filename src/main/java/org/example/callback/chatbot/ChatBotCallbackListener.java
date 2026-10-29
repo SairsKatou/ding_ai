@@ -314,7 +314,7 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 				+ "   - 示例 2（自定义分支）：`克隆分支 dev` 或 `克隆分支 master`\n"
 				+ "   - 示例 3（完整指定）：`克隆分支 changtai-cloud dev`\n\n"
 				+ "4. **🔍 分支代码扫描与大模型审计**\n"
-				+ "   - 快速单轮扫描：`代码扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <问题诉求>`\n"
+				+ "   - 快速扫描（最多 3 轮，可补读源码）：`代码扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <问题诉求>`\n"
 				+ "   - 深度探查（多轮 Agent）：`深度扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <问题诉求>`\n"
 				+ "   - 示例 1（快速梳理）：`代码扫描 梳理实报费用新增的校验逻辑`\n"
 				+ "   - 示例 2（多轮深度探查表名）：`深度扫描 调拨单涉及的表名是哪些`\n"

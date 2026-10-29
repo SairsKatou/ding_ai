@@ -1,10 +1,13 @@
 package org.example.service;
 
 import com.ct.common.core.constant.Constants;
+import org.apache.commons.lang3.StringUtils;
+import org.example.domain.dto.CodeAgentAnalysisDTO;
 import org.example.domain.dto.CodeAgentSeedDTO;
 import org.example.domain.dto.OpenChatFunctionCallDTO;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.OpenChatToolCallDTO;
+import org.example.domain.dto.OpenChatToolDTO;
 import org.example.domain.dto.YunxiaoCodeScanParam;
 import org.example.domain.dto.YunxiaoCodeScanResultDTO;
 import org.example.service.impl.YunxiaoCodeAgentServiceImpl;
@@ -237,6 +240,122 @@ public class YunxiaoCodeAgentServiceTest {
 
         assertEquals("汇总报告", result.getAnalysisReport());
         assertTrue(System.currentTimeMillis() - start < Constants.THREE_THOUSAND);
+    }
+
+    /**
+     * 测试普通扫描 3 轮：前 2 轮提供工具，第 3 轮不提供工具并直接得到结论，无单独汇总调用；读取的文件计入结果
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testAnalyzeWithToolsThreeTurns() throws IOException {
+        Path serviceFile = tempRepoDir.toPath().resolve("service/DemoServiceImpl.java");
+        Files.createDirectories(serviceFile.getParent());
+        Files.writeString(serviceFile, "class DemoServiceImpl {}\n");
+        List<OpenChatToolDTO> tools = List.of(OpenChatToolDTO.builder().type("function").build());
+        when(yunxiaoAgentToolService.getToolDefinitions()).thenReturn(tools);
+        when(yunxiaoAgentToolService.executeTool(anyString(), anyString(), any())).thenReturn("源码");
+        when(openCodeService.chatWithTools(anyList(), any()))
+                .thenReturn(toolCallReply("c1", "read_method", "{\"file_path\":\"service/DemoServiceImpl.java\",\"method_name\":\"add\"}"))
+                .thenReturn(toolCallReply("c2", "find_callers", "{\"method_name\":\"add\"}"))
+                .thenReturn(textReply("最终结论"));
+
+        CodeAgentAnalysisDTO result = yunxiaoCodeAgentService.analyzeWithTools(initialMessages(), tempRepoDir, Constants.THREE);
+
+        assertEquals("最终结论", result.getReport());
+        assertEquals(Constants.THREE, result.getTurns());
+        assertEquals(List.of("service/DemoServiceImpl.java"), result.getReadFiles());
+        ArgumentCaptor<List<OpenChatToolDTO>> toolsCaptor = ArgumentCaptor.forClass(List.class);
+        verify(openCodeService, times(Constants.THREE)).chatWithTools(anyList(), toolsCaptor.capture());
+        assertEquals(tools, toolsCaptor.getAllValues().get(Constants.ZERO));
+        assertEquals(tools, toolsCaptor.getAllValues().get(Constants.ONE));
+        assertTrue(toolsCaptor.getAllValues().get(Constants.TWO).isEmpty());
+        verify(openCodeService, never()).chat(anyList());
+    }
+
+    /**
+     * 测试普通扫描：片段足够时第 1 轮直接作答，不追问、不要求必须调用工具
+     */
+    @Test
+    public void testAnalyzeWithToolsDirectAnswer() {
+        when(yunxiaoAgentToolService.getToolDefinitions()).thenReturn(Collections.emptyList());
+        when(openCodeService.chatWithTools(anyList(), any())).thenReturn(textReply("直接结论"));
+
+        CodeAgentAnalysisDTO result = yunxiaoCodeAgentService.analyzeWithTools(initialMessages(), tempRepoDir, Constants.THREE);
+
+        assertEquals("直接结论", result.getReport());
+        assertEquals(Constants.ONE, result.getTurns());
+        verify(openCodeService, times(Constants.ONE)).chatWithTools(anyList(), any());
+    }
+
+    /**
+     * 测试普通扫描：第 1 轮即失败且没有任何工具结果时抛出异常，不再重复发送相同上下文汇总
+     */
+    @Test
+    public void testAnalyzeWithToolsFirstTurnFailureThrows() {
+        when(yunxiaoAgentToolService.getToolDefinitions()).thenReturn(Collections.emptyList());
+        when(openCodeService.chatWithTools(anyList(), any())).thenThrow(new RuntimeException("模型全部不可用"));
+
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> yunxiaoCodeAgentService.analyzeWithTools(initialMessages(), tempRepoDir, Constants.THREE));
+        assertTrue(e.getMessage().contains("模型全部不可用"));
+        verify(openCodeService, never()).chat(anyList());
+    }
+
+    /**
+     * 测试最后一轮（不提供工具）模型把工具调用写成 DSML 文本：先明确告知不再提供工具；
+     * 仍输出标记时丢弃该回复并汇总，不把标记当作结论返回
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testLeakedToolMarkupIsNotReturned() {
+        String leaked = "<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name=\"grep_code\"> "
+                + "<｜｜DSML｜｜ parameter name=\"keyword\" string=\"true\">REQUESTED</｜｜DSML｜｜ parameter> </｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>";
+        when(yunxiaoAgentToolService.getToolDefinitions()).thenReturn(Collections.emptyList());
+        when(yunxiaoAgentToolService.executeTool(anyString(), anyString(), any())).thenReturn("源码");
+        when(openCodeService.chatWithTools(anyList(), any()))
+                .thenReturn(toolCallReply("c1", "grep_code", "{\"keyword\":\"prepay\"}"))
+                .thenReturn(toolCallReply("c2", "grep_code", "{\"keyword\":\"status\"}"))
+                .thenReturn(textReply(leaked));
+        when(openCodeService.chat(anyList())).thenReturn("可使用已审核状态的采购预付单");
+
+        CodeAgentAnalysisDTO result = yunxiaoCodeAgentService.analyzeWithTools(initialMessages(), tempRepoDir, Constants.THREE);
+
+        assertEquals("可使用已审核状态的采购预付单", result.getReport());
+        ArgumentCaptor<List<OpenChatMessageDTO>> captor = ArgumentCaptor.forClass(List.class);
+        verify(openCodeService, times(Constants.THREE)).chatWithTools(captor.capture(), any());
+        List<OpenChatMessageDTO> lastTurn = captor.getAllValues().get(Constants.TWO);
+        assertTrue(lastTurn.get(lastTurn.size() - Constants.ONE).getContent().contains("本轮不再提供任何工具"));
+        // 泄漏的标记不进入汇总上下文
+        ArgumentCaptor<List<OpenChatMessageDTO>> summaryCaptor = ArgumentCaptor.forClass(List.class);
+        verify(openCodeService).chat(summaryCaptor.capture());
+        assertTrue(summaryCaptor.getValue().stream().noneMatch(m -> StringUtils.contains(m.getContent(), "DSML")));
+    }
+
+    /**
+     * 测试汇总仍只输出工具调用标记：返回空报告（普通扫描据此改用一次性调用兜底），深度扫描抛出异常降级
+     */
+    @Test
+    public void testLeakedMarkupInSummaryReturnsBlank() {
+        String leaked = "<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name=\"grep_code\"></｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>";
+        when(codeSearchKeywordService.resolveCoreKeyword(any(), anyString())).thenReturn("采购预付单");
+        when(yunxiaoAgentToolService.getToolDefinitions()).thenReturn(Collections.emptyList());
+        when(yunxiaoAgentToolService.executeTool(anyString(), anyString(), any())).thenReturn("源码");
+        when(openCodeService.chatWithTools(anyList(), any()))
+                .thenReturn(toolCallReply("c1", "grep_code", "{\"keyword\":\"prepay\"}"))
+                .thenReturn(textReply(leaked));
+        when(openCodeService.chat(anyList())).thenReturn(leaked);
+
+        CodeAgentAnalysisDTO quick = yunxiaoCodeAgentService.analyzeWithTools(initialMessages(), tempRepoDir, Constants.THREE);
+        assertTrue(StringUtils.isBlank(quick.getReport()));
+
+        assertThrows(IllegalStateException.class, () -> yunxiaoCodeAgentService.executeDeepScan(
+                buildParam("采购应付单可以使用什么状态的采购预付单"), tempRepoDir, "changtai-cloud", "6120951"));
+    }
+
+    private List<OpenChatMessageDTO> initialMessages() {
+        return List.of(
+                OpenChatMessageDTO.builder().role("system").content("系统提示").build(),
+                OpenChatMessageDTO.builder().role("user").content("源码片段与问题").build());
     }
 
     private YunxiaoCodeScanParam buildParam(String question) {

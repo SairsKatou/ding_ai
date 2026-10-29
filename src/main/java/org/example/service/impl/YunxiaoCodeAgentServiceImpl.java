@@ -6,6 +6,7 @@ import com.ct.common.core.constant.Constants;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.example.domain.dto.CodeAgentAnalysisDTO;
 import org.example.domain.dto.CodeAgentSeedDTO;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.domain.dto.OpenChatToolCallDTO;
@@ -26,6 +27,7 @@ import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -67,6 +69,18 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService, Dis
     private static final int MAX_TURNS = Constants.TEN;
 
     /**
+     * 模型以文本形式输出的工具调用标记：DeepSeek 的 <｜DSML｜…> / <｜tool▁calls▁begin｜>，以及常见的 XML 风格写法
+     */
+    private static final Pattern TOOL_CALL_MARKUP = Pattern.compile(
+            "<[｜|]+\\s*DSML|<[｜|]tool▁|</?(?:tool_calls?|function_calls)>|<invoke\\s+name\\s*=");
+
+    /**
+     * 不再提供工具时的明确指令
+     */
+    private static final String NO_MORE_TOOLS_INSTRUCTION = "本轮不再提供任何工具，禁止输出任何工具调用或调用标记。"
+            + "请直接根据上方已读取的源码，用中文输出最终结论；源码不足以回答的部分，用一句话说明缺少哪个类的哪个方法。";
+
+    /**
      * 单个工具结果写入上下文的最大字符数
      */
     private static final int MAX_TOOL_RESULT_CHARS = Constants.TEN_THOUSAND;
@@ -106,6 +120,12 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService, Dis
      * 本地检索初始线索的时限（可能包含一次大模型推断检索词）
      */
     private long seedTimeoutMillis = (long) Constants.THIRTY * Constants.THOUSAND;
+
+    /**
+     * 普通代码扫描 Agent 的交互循环总时限 / 汇总时限（首轮上下文含大量代码片段，单轮耗时较长）
+     */
+    private long quickLoopTimeoutMillis = (long) Constants.FIVE * Constants.SIXTY_THOUSAND;
+    private long quickSummaryTimeoutMillis = (long) Constants.THREE * Constants.SIXTY_THOUSAND;
 
     /**
      * 大模型调用线程池：用于对单次调用施加剩余时限，超时后主流程直接进入汇总
@@ -161,78 +181,17 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService, Dis
                 .build());
 
         AgentState state = new AgentState(repoDir.toPath().toAbsolutePath().normalize());
-        String finalAnalysis = "";
-        boolean nudged = false;
-        int turn = Constants.ZERO;
-
-        // 2. 多轮 Tool Calling 交互循环（最多 MAX_TURNS 轮，且不超过总时限）
-        while (turn < MAX_TURNS) {
-            long remaining = loopDeadline - System.currentTimeMillis();
-            if (remaining <= Constants.ZERO) {
-                log.warn("Agent 探查达到总时限 {} ms，停止探查进入汇总", loopTimeoutMillis);
-                break;
-            }
-            turn++;
-            compressOldToolResults(state, turn);
-            log.info("Agent 深度探查第 {}/{} 轮交互开始，剩余时间 {} 秒...", turn, MAX_TURNS, remaining / Constants.THOUSAND);
-
-            OpenChatMessageDTO assistantReply;
-            List<OpenChatMessageDTO> snapshot = new ArrayList<>(conversation);
-            try {
-                assistantReply = callWithTimeout(() -> openCodeService.chatWithTools(snapshot, tools), remaining);
-            } catch (TimeoutException e) {
-                log.warn("第 {} 轮大模型调用超出剩余时限，停止探查进入汇总", turn);
-                break;
-            } catch (Exception e) {
-                log.error("第 {} 轮大模型调用异常: {}", turn, e.getMessage(), e);
-                break;
-            }
-
-            if (assistantReply == null) {
-                log.warn("第 {} 轮大模型返回空，中断循环", turn);
-                break;
-            }
-            conversation.add(assistantReply);
-
-            List<OpenChatToolCallDTO> toolCalls = assistantReply.getToolCalls();
-            if (CollectionUtils.isEmpty(toolCalls)) {
-                // 尚未成功读取任何源码就给出结论：要求先用工具核实一次，避免凭空作答
-                if (state.successfulCalls.get() == Constants.ZERO && !nudged) {
-                    nudged = true;
-                    log.info("Agent 第 {} 轮未调用任何工具即给出结论，要求先核实源码", turn);
-                    conversation.add(OpenChatMessageDTO.builder()
-                            .role(ROLE_USER)
-                            .content("你还没有读取任何源码。请先调用工具（如 read_method、list_methods）核实代码，再给出结论。")
-                            .build());
-                    continue;
-                }
-                log.info("Agent 在第 {} 轮完成探查并生成最终分析报告，长度: {}", turn, StringUtils.length(assistantReply.getContent()));
-                finalAnalysis = assistantReply.getContent();
-                break;
-            }
-
-            String progressHint = buildProgressHint(turn, loopDeadline);
-            for (int i = Constants.ZERO; i < toolCalls.size(); i++) {
-                // 进度提示附在本轮最后一个工具结果上
-                conversation.add(executeToolCall(toolCalls.get(i), state, turn, i == toolCalls.size() - Constants.ONE ? progressHint : null));
-            }
-        }
-
-        // 3. 没有成功读取任何源码时不做汇总（只能凭空作答），交由调用方降级为普通扫描
-        if (state.successfulCalls.get() == Constants.ZERO) {
-            throw new IllegalStateException("Agent 未能成功调用任何代码探查工具");
-        }
-
-        // 4. 达到最大轮数或时限仍未返回最终文本，进行一次终结总结提问
+        RunOptions options = new RunOptions(MAX_TURNS, loopDeadline, summaryTimeoutMillis, true, false, true);
+        String finalAnalysis = runLoop(conversation, tools, state, options);
         if (StringUtils.isBlank(finalAnalysis)) {
-            finalAnalysis = summarize(conversation);
+            throw new IllegalStateException("大模型未输出有效结论");
         }
 
         List<String> fileList = new ArrayList<>(state.readFiles);
         state.referencedFiles.stream().filter(path -> !state.readFiles.contains(path)).forEach(fileList::add);
         finalAnalysis = CodeCitationVerifier.appendWarnings(finalAnalysis, repoDir, fileList);
 
-        log.info("【Agent 结束】共 {} 轮、成功工具调用 {} 次、读取文件 {} 个，耗时 {} 秒", turn, state.successfulCalls.get(),
+        log.info("【Agent 结束】共 {} 轮、成功工具调用 {} 次、读取文件 {} 个，耗时 {} 秒", state.turns, state.successfulCalls.get(),
                 state.readFiles.size(), (System.currentTimeMillis() - startedAt) / Constants.THOUSAND);
 
         return YunxiaoCodeScanResultDTO.builder()
@@ -244,6 +203,139 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService, Dis
                 .matchedFiles(fileList)
                 .analysisReport(finalAnalysis)
                 .build();
+    }
+
+    /**
+     * 在已组装好的上下文（如普通扫描预先检索的代码片段）基础上，允许大模型调用探查工具补充源码；
+     * 最多 maxTurns 次大模型调用，最后一次不提供工具，强制输出结论
+     *
+     * @param initialMessages 初始上下文（system + user）
+     * @param repoDir         本地克隆仓库目录
+     * @param maxTurns        最多大模型调用次数
+     * @return 分析结果
+     */
+    @Override
+    public CodeAgentAnalysisDTO analyzeWithTools(List<OpenChatMessageDTO> initialMessages, File repoDir, int maxTurns) {
+        long startedAt = System.currentTimeMillis();
+        List<OpenChatMessageDTO> conversation = new ArrayList<>(initialMessages);
+        AgentState state = new AgentState(repoDir.toPath().toAbsolutePath().normalize());
+        RunOptions options = new RunOptions(Math.max(Constants.ONE, maxTurns), startedAt + quickLoopTimeoutMillis,
+                quickSummaryTimeoutMillis, false, true, false);
+        log.info("【代码扫描 Agent】启动，最多 {} 轮（最后一轮不提供工具）", options.maxTurns());
+
+        String report = runLoop(conversation, yunxiaoAgentToolService.getToolDefinitions(), state, options);
+
+        log.info("【代码扫描 Agent】结束，共 {} 轮、成功工具调用 {} 次、读取文件 {} 个，耗时 {} 秒", state.turns,
+                state.successfulCalls.get(), state.readFiles.size(), (System.currentTimeMillis() - startedAt) / Constants.THOUSAND);
+        return CodeAgentAnalysisDTO.builder()
+                .report(report)
+                .readFiles(new ArrayList<>(state.readFiles))
+                .referencedFiles(new ArrayList<>(state.referencedFiles))
+                .turns(state.turns)
+                .successfulToolCalls(state.successfulCalls.get())
+                .build();
+    }
+
+    /**
+     * 多轮 Tool Calling 交互循环
+     *
+     * @param conversation 对话上下文（会被追加）
+     * @param tools        工具定义
+     * @param state        探查状态
+     * @param options      运行参数
+     * @return 最终分析报告
+     * @throws IllegalStateException 要求必须调用工具但未成功调用，或首轮即失败且无任何源码可供汇总
+     */
+    private String runLoop(List<OpenChatMessageDTO> conversation, List<OpenChatToolDTO> tools, AgentState state, RunOptions options) {
+        String finalAnalysis = "";
+        boolean nudged = false;
+        Exception loopError = null;
+
+        while (state.turns < options.maxTurns()) {
+            long remaining = options.deadline() - System.currentTimeMillis();
+            if (remaining <= Constants.ZERO) {
+                log.warn("Agent 探查达到总时限，停止探查进入汇总");
+                break;
+            }
+            state.turns++;
+            int turn = state.turns;
+            compressOldToolResults(state, turn);
+            // 最后一轮不提供工具，模型只能直接给出结论，省去单独的汇总调用
+            boolean lastTurnNoTools = options.lastTurnWithoutTools() && turn == options.maxTurns();
+            List<OpenChatToolDTO> turnTools = lastTurnNoTools ? Collections.emptyList() : tools;
+            if (lastTurnNoTools && turn > Constants.ONE) {
+                // 上下文中有工具调用历史但本轮不提供工具时，部分模型（如 DeepSeek）会把工具调用以文本标记输出，需明确告知
+                conversation.add(OpenChatMessageDTO.builder()
+                        .role(ROLE_USER)
+                        .content(NO_MORE_TOOLS_INSTRUCTION)
+                        .build());
+            }
+            log.info("Agent 第 {}/{} 轮交互开始{}，剩余时间 {} 秒...", turn, options.maxTurns(),
+                    lastTurnNoTools ? "（不提供工具）" : "", remaining / Constants.THOUSAND);
+
+            OpenChatMessageDTO assistantReply;
+            List<OpenChatMessageDTO> snapshot = new ArrayList<>(conversation);
+            try {
+                assistantReply = callWithTimeout(() -> openCodeService.chatWithTools(snapshot, turnTools), remaining);
+            } catch (TimeoutException e) {
+                log.warn("第 {} 轮大模型调用超出剩余时限，停止探查进入汇总", turn);
+                loopError = e;
+                break;
+            } catch (Exception e) {
+                log.error("第 {} 轮大模型调用异常: {}", turn, e.getMessage(), e);
+                loopError = e;
+                break;
+            }
+
+            if (assistantReply == null) {
+                log.warn("第 {} 轮大模型返回空，中断循环", turn);
+                break;
+            }
+            List<OpenChatToolCallDTO> toolCalls = assistantReply.getToolCalls();
+            if (CollectionUtils.isEmpty(toolCalls) && containsToolMarkup(assistantReply.getContent())) {
+                // 模型把工具调用写成了文本（未被解析为 tool_calls），不能当作结论，进入汇总
+                log.warn("第 {} 轮大模型以文本形式输出了工具调用标记，丢弃该回复并进入汇总", turn);
+                break;
+            }
+            conversation.add(assistantReply);
+
+            if (CollectionUtils.isEmpty(toolCalls)) {
+                // 尚未成功读取任何源码就给出结论：要求先用工具核实一次，避免凭空作答
+                if (options.requireToolCall() && state.successfulCalls.get() == Constants.ZERO && !nudged) {
+                    nudged = true;
+                    log.info("Agent 第 {} 轮未调用任何工具即给出结论，要求先核实源码", turn);
+                    conversation.add(OpenChatMessageDTO.builder()
+                            .role(ROLE_USER)
+                            .content("你还没有读取任何源码。请先调用工具（如 read_method、list_methods）核实代码，再给出结论。")
+                            .build());
+                    continue;
+                }
+                log.info("Agent 在第 {} 轮生成最终分析报告，长度: {}", turn, StringUtils.length(assistantReply.getContent()));
+                finalAnalysis = assistantReply.getContent();
+                break;
+            }
+
+            String progressHint = buildProgressHint(turn, options.maxTurns(), options.deadline());
+            for (int i = Constants.ZERO; i < toolCalls.size(); i++) {
+                // 进度提示附在本轮最后一个工具结果上
+                conversation.add(executeToolCall(toolCalls.get(i), state, turn, i == toolCalls.size() - Constants.ONE ? progressHint : null));
+            }
+        }
+
+        // 没有成功读取任何源码时不做汇总（只能凭空作答），交由调用方降级
+        if (options.requireToolCall() && state.successfulCalls.get() == Constants.ZERO) {
+            throw new IllegalStateException("Agent 未能成功调用任何代码探查工具");
+        }
+        if (StringUtils.isNotBlank(finalAnalysis)) {
+            return finalAnalysis;
+        }
+        // 首轮即失败且没有任何工具结果：上下文与首轮相同，再汇总只会重复失败
+        if (loopError != null && state.successfulCalls.get() == Constants.ZERO) {
+            throw new IllegalStateException("大模型调用失败: "
+                    + StringUtils.defaultIfBlank(loopError.getMessage(), loopError.getClass().getSimpleName()), loopError);
+        }
+        // 达到最大轮数或时限仍未返回最终文本，进行一次终结总结提问
+        return summarize(conversation, options);
     }
 
     /**
@@ -416,36 +508,64 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService, Dis
     /**
      * 进度提示：剩余轮数与时间；最后一轮要求直接输出结论
      */
-    private String buildProgressHint(int turn, long loopDeadline) {
-        int remainingTurns = MAX_TURNS - turn;
+    private String buildProgressHint(int turn, int maxTurns, long loopDeadline) {
+        int remainingTurns = maxTurns - turn;
         long remainingMillis = loopDeadline - System.currentTimeMillis();
-        if (remainingTurns <= Constants.ZERO || remainingMillis < LAST_TURN_THRESHOLD_MILLIS) {
+        // 只剩最后一轮时就要求停止调用工具，避免最后一轮仍在取证而不得不额外汇总
+        if (remainingTurns <= Constants.ONE || remainingMillis < LAST_TURN_THRESHOLD_MILLIS) {
             return "【进度】探查轮数或时间即将用尽，下一轮请停止调用工具，直接根据已读取的源码输出最终结论。";
         }
-        return "【进度】已完成 " + turn + "/" + MAX_TURNS + " 轮，剩余约 " + remainingMillis / Constants.THOUSAND
+        return "【进度】已完成 " + turn + "/" + maxTurns + " 轮，剩余约 " + remainingMillis / Constants.THOUSAND
                 + " 秒；信息足够时请立即停止调用工具并输出结论。";
     }
 
     /**
      * 最终汇总：基于已探查到的源码输出报告，单独施加时限
      */
-    private String summarize(List<OpenChatMessageDTO> conversation) {
+    private String summarize(List<OpenChatMessageDTO> conversation, RunOptions options) {
         log.info("Agent 达到最大探查轮数或时限，进行一次性汇总归纳调用...");
         conversation.add(OpenChatMessageDTO.builder()
                 .role(ROLE_USER)
-                .content("请停止调用工具，根据上面探查到的所有源码事实和线索，立即输出最终总结分析报告。"
-                        + "只写工具输出中出现过的类、方法、字段与行号，没有读到的内容不要推测。")
+                .content(NO_MORE_TOOLS_INSTRUCTION + "只写工具输出中出现过的类、方法、字段与行号，没有读到的内容不要推测。")
                 .build());
         List<OpenChatMessageDTO> snapshot = new ArrayList<>(conversation);
         try {
-            return callWithTimeout(() -> openCodeService.chat(snapshot), summaryTimeoutMillis);
+            String summary = callWithTimeout(() -> openCodeService.chat(snapshot), options.summaryTimeoutMillis());
+            if (containsToolMarkup(summary)) {
+                // 汇总仍输出工具调用标记：只保留标记之前的正文，没有正文时返回空，由调用方兜底
+                String cleaned = stripToolMarkup(summary);
+                log.warn("汇总回复包含工具调用标记，已截除，剩余正文长度: {}", cleaned.length());
+                return cleaned;
+            }
+            return summary;
         } catch (TimeoutException e) {
-            log.error("最终汇总大模型调用超时 ({} ms)", summaryTimeoutMillis);
+            log.error("最终汇总大模型调用超时 ({} ms)", options.summaryTimeoutMillis());
+            if (!options.summaryFailureAsMessage()) {
+                throw new IllegalStateException("大模型生成分析报告超时", e);
+            }
             return "多轮探查已完成，但大模型生成总结时超时，请稍后重试或改用普通代码扫描。";
         } catch (Exception e) {
             log.error("最终汇总大模型调用异常: {}", e.getMessage(), e);
+            if (!options.summaryFailureAsMessage()) {
+                throw new IllegalStateException("大模型生成分析报告失败: " + e.getMessage(), e);
+            }
             return "多轮探查已完成，但大模型生成总结时超时或异常: " + e.getMessage();
         }
+    }
+
+    /**
+     * 回复正文中是否包含以文本形式输出的工具调用标记
+     */
+    private boolean containsToolMarkup(String content) {
+        return StringUtils.isNotBlank(content) && TOOL_CALL_MARKUP.matcher(content).find();
+    }
+
+    /**
+     * 截除第一个工具调用标记及之后的内容
+     */
+    private String stripToolMarkup(String content) {
+        Matcher matcher = TOOL_CALL_MARKUP.matcher(content);
+        return matcher.find() ? content.substring(Constants.ZERO, matcher.start()).trim() : content.trim();
     }
 
     /**
@@ -549,10 +669,25 @@ public class YunxiaoCodeAgentServiceImpl implements YunxiaoCodeAgentService, Dis
         private final Set<String> readFiles = new LinkedHashSet<>();
         private final Set<String> referencedFiles = new LinkedHashSet<>();
         private final AtomicInteger successfulCalls = new AtomicInteger();
+        private int turns;
 
         private AgentState(Path repoRoot) {
             this.repoRoot = repoRoot;
         }
+    }
+
+    /**
+     * 多轮交互运行参数
+     *
+     * @param maxTurns                最多大模型调用次数
+     * @param deadline                交互循环截止时间戳
+     * @param summaryTimeoutMillis    最终汇总调用时限
+     * @param requireToolCall         是否必须成功调用工具（深度扫描：否则追问一次，仍未调用则抛出异常）
+     * @param lastTurnWithoutTools    最后一轮是否不提供工具（强制直接输出结论）
+     * @param summaryFailureAsMessage 汇总失败时返回提示文本（true）还是抛出异常（false）
+     */
+    private record RunOptions(int maxTurns, long deadline, long summaryTimeoutMillis, boolean requireToolCall,
+                              boolean lastTurnWithoutTools, boolean summaryFailureAsMessage) {
     }
 
     /**
