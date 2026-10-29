@@ -134,7 +134,7 @@ public class YunxiaoGitCloneServiceTest {
                 + "}\n";
         Files.writeString(controllerFile.toPath(), code, StandardCharsets.UTF_8);
 
-        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(repoDir, "实报", Constants.TEN);
+        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(repoDir, "实报", "梳理实报使用的地方", Constants.TEN);
 
         assertNotNull(snippets);
         assertFalse(snippets.isEmpty());
@@ -176,7 +176,7 @@ public class YunxiaoGitCloneServiceTest {
                 .append("    }\n}\n");
         Files.writeString(new File(serviceDir, "HeadStatementServiceImpl.java").toPath(), serviceCode.toString(), StandardCharsets.UTF_8);
 
-        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(repoDir, "对账单明细拆分", Constants.TEN);
+        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(repoDir, "对账单明细拆分", "对账单明细拆分逻辑", Constants.TEN);
 
         assertEquals(Constants.FIVE + Constants.ONE, snippets.size());
         assertEquals("service/HeadStatementServiceImpl.java", snippets.get(Constants.ZERO).getFilePath());
@@ -201,13 +201,111 @@ public class YunxiaoGitCloneServiceTest {
         bigCode.append("}\n");
         Files.writeString(new File(repoDir, "CommonService.java").toPath(), bigCode.toString(), StandardCharsets.UTF_8);
 
-        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(repoDir, "reimbursement", Constants.TEN);
+        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(repoDir, "reimbursement", "reimbursement", Constants.TEN);
 
         assertEquals(Constants.ONE, snippets.size());
         String bigSnippet = snippets.get(Constants.ZERO).getSnippet();
         // 相关度第 1 的文件上限为 4 倍单文件长度
         assertTrue(bigSnippet.length() <= Constants.FOUR_THOUSAND * Constants.EIGHT + Constants.HUNDRED);
         assertTrue(bigSnippet.contains("片段过长已截断"));
+    }
+
+    /**
+     * 测试按方法整体截取：命中方法超过 50 行时完整保留方法体，并追入被调用的私有校验方法（方法名不含关键词）
+     */
+    @Test
+    public void testScanLocalRepositoryMethodLevelSnippet() throws IOException {
+        File repoDir = new File(tempCacheDir, "method-repo");
+        File serviceDir = new File(repoDir, "service");
+        serviceDir.mkdirs();
+
+        StringBuilder code = new StringBuilder("public class ScmActualReimbursementServiceImpl {\n");
+        // 无关方法撑大文件
+        for (int m = Constants.ZERO; m < Constants.TWENTY; m++) {
+            code.append("    public void other").append(m).append("() {\n");
+            for (int i = Constants.ZERO; i < Constants.TEN; i++) {
+                code.append("        int unrelatedValue").append(i).append(" = ").append(i).append(";\n");
+            }
+            code.append("    }\n");
+        }
+        code.append("    /** 实报新增 */\n")
+                .append("    public Long addReimbursement(ReimbursementDTO dto) {\n");
+        for (int i = Constants.ZERO; i < Constants.HUNDRED; i++) {
+            code.append("        int step").append(i).append(" = ").append(i).append(";\n");
+        }
+        code.append("        preCheckAll(dto);\n")
+                .append("        return MAIN_FLOW_END;\n")
+                .append("    }\n")
+                .append("    private void preCheckAll(Object dto) {\n")
+                .append("        if (dto == null) { throw new RuntimeException(\"CALLEE_BODY\"); }\n")
+                .append("    }\n")
+                .append("}\n");
+        Files.writeString(new File(serviceDir, "ScmActualReimbursementServiceImpl.java").toPath(), code.toString(), StandardCharsets.UTF_8);
+
+        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(
+                repoDir, "实报费用新增", "梳理实报费用新增的校验逻辑", Constants.TEN);
+
+        assertEquals(Constants.ONE, snippets.size());
+        String snippet = snippets.get(Constants.ZERO).getSnippet();
+        assertTrue(snippet.contains("public Long addReimbursement"));
+        // 方法体第 100 行之后的主流程结尾仍在片段中（旧逻辑只取声明下 50 行）
+        assertTrue(snippet.contains("MAIN_FLOW_END"));
+        // 被调用的私有方法整体纳入
+        assertTrue(snippet.contains("CALLEE_BODY"));
+        // 远离命中行的无关方法不纳入（类声明行附近的 ± 3 行上下文除外）
+        assertFalse(snippet.contains("public void other10()"));
+    }
+
+    /**
+     * 测试问题不涉及测试时排除测试代码，问题涉及前端时才不降权前端文件
+     */
+    @Test
+    public void testScanLocalRepositoryExcludesTestFiles() throws IOException {
+        File repoDir = new File(tempCacheDir, "filter-repo");
+        File mainDir = new File(repoDir, "src/main/java/com/ct/scm");
+        File testDir = new File(repoDir, "src/test/java/com/ct/scm");
+        mainDir.mkdirs();
+        testDir.mkdirs();
+        Files.writeString(new File(mainDir, "AllocationOrderServiceImpl.java").toPath(),
+                "public class AllocationOrderServiceImpl { /* 调拨单 */ }\n", StandardCharsets.UTF_8);
+        Files.writeString(new File(testDir, "AllocationOrderServiceTest.java").toPath(),
+                "public class AllocationOrderServiceTest { /* 调拨单 调拨单 调拨单 */ }\n", StandardCharsets.UTF_8);
+
+        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(
+                repoDir, "调拨单", "调拨单的审核逻辑", Constants.TEN);
+        assertEquals(Constants.ONE, snippets.size());
+        assertEquals("src/main/java/com/ct/scm/AllocationOrderServiceImpl.java", snippets.get(Constants.ZERO).getFilePath());
+
+        List<YunxiaoCodeSnippetDTO> withTests = yunxiaoGitCloneService.scanLocalRepository(
+                repoDir, "调拨单", "调拨单的单元测试", Constants.TEN);
+        assertEquals(Constants.TWO, withTests.size());
+    }
+
+    /**
+     * 测试业务字典未覆盖时调用大模型推断英文实体词，命中英文类名文件
+     */
+    @Test
+    public void testScanLocalRepositoryInfersTermsWhenDictMissing() throws IOException {
+        OpenCodeService openCodeService = org.mockito.Mockito.mock(OpenCodeService.class);
+        CodeSearchKeywordServiceImpl keywordService = new CodeSearchKeywordServiceImpl();
+        ReflectionTestUtils.setField(keywordService, "openCodeService", openCodeService);
+        ReflectionTestUtils.setField(yunxiaoGitCloneService, "codeSearchKeywordService", keywordService);
+        when(openCodeService.chat(org.mockito.ArgumentMatchers.anyList()))
+                .thenReturn("实体: after_sale,aftersale,ticket\n动作: audit");
+
+        File repoDir = new File(tempCacheDir, "ai-repo");
+        repoDir.mkdirs();
+        Files.writeString(new File(repoDir, "AfterSaleTicketServiceImpl.java").toPath(),
+                "public class AfterSaleTicketServiceImpl { public void audit() {} }\n", StandardCharsets.UTF_8);
+        // 只有注释命中中文的无关文件：旧逻辑会因「有命中」跳过大模型推断
+        Files.writeString(new File(repoDir, "CommonUtil.java").toPath(),
+                "public class CommonUtil { /* 售后工单 */ }\n", StandardCharsets.UTF_8);
+
+        List<YunxiaoCodeSnippetDTO> snippets = yunxiaoGitCloneService.scanLocalRepository(
+                repoDir, "售后工单", "售后工单审核逻辑", Constants.TEN);
+
+        assertEquals("AfterSaleTicketServiceImpl.java", snippets.get(Constants.ZERO).getFilePath());
+        org.mockito.Mockito.verify(openCodeService).chat(org.mockito.ArgumentMatchers.anyList());
     }
 
     /**

@@ -34,16 +34,25 @@ import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.Resource;
 import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -127,6 +136,22 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
     private static final Pattern TABLE_QUESTION_PATTERN = Pattern.compile(
             "(?<!报)表名|几张(?:数据库)?表|多少张表|(?:哪些|什么|几个)(?:数据库)?表|(?:数据库|业务|相关|核心)表|涉及.{0,6}表|用到.{0,6}表");
 
+    /**
+     * 报告中的代码引用：文件名.java:行号、文件名.xml:行号、文件名.java:起始行-结束行（兼容全角冒号）
+     */
+    private static final Pattern CODE_CITATION = Pattern.compile(
+            "\\b([A-Za-z][\\w$-]*\\.(?:java|xml))\\s*[:：]\\s*(\\d{1,7})(?:\\s*[-~]\\s*(\\d{1,7}))?");
+
+    /**
+     * 核对引用时跳过的目录
+     */
+    private static final Set<String> CITATION_SKIP_DIRS = Set.of(".git", "target", "node_modules", ".idea", ".mvn", "bin");
+
+    /**
+     * 报告末尾最多列出的核对未通过引用数
+     */
+    private static final int MAX_CITATION_WARNINGS = Constants.TEN;
+
     @Resource
     private RestTemplate yunxiaoRestTemplate;
 
@@ -201,10 +226,11 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
 
         // 优先采用【方案 A】：本地 Git 浅克隆缓存策略（保留 2 小时，本地毫秒级全量扫描，默认分析 50 个文件、最大 100 个）
         boolean planASuccess = false;
+        File localRepoDir = null;
         if (StringUtils.isNotBlank(cloneUrl)) {
             try {
                 log.info("【方案 A 启动】准备仓库 [{}] 分支 [{}] 本地 Git 浅克隆缓存 (保留 2 小时)...", actualRepoName, branch);
-                File localRepoDir = yunxiaoGitCloneService.prepareLocalRepository(actualRepoId, actualRepoName, branch, cloneUrl);
+                localRepoDir = yunxiaoGitCloneService.prepareLocalRepository(actualRepoId, actualRepoName, branch, cloneUrl);
 
                 // 若开启多轮 Agent 深度代码探查模式，转交 YunxiaoCodeAgentService 执行 Tool Calling
                 if (Boolean.TRUE.equals(param.getDeepScan())) {
@@ -212,7 +238,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                     return yunxiaoCodeAgentService.executeDeepScan(param, localRepoDir, actualRepoName, actualRepoId);
                 }
 
-                matchedSnippets = yunxiaoGitCloneService.scanLocalRepository(localRepoDir, searchKeyword, localMaxFiles);
+                matchedSnippets = yunxiaoGitCloneService.scanLocalRepository(localRepoDir, searchKeyword, question, localMaxFiles);
                 if (tableQuestion) {
                     tableSummary = buildTableSummary(localRepoDir, searchKeyword);
                 }
@@ -251,6 +277,9 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 : buildPromptMessages(actualRepoName, actualRepoId, branch, question, searchKeyword, matchedSnippets);
         log.info("准备调用 OpenCode 大模型进行分支代码梳理分析...");
         String analysisReport = openCodeService.chat(messages);
+        if (planASuccess) {
+            analysisReport = appendCitationWarnings(analysisReport, localRepoDir, matchedSnippets);
+        }
 
         List<String> matchedFilePaths = matchedSnippets.stream()
                 .map(YunxiaoCodeSnippetDTO::getFilePath)
@@ -781,51 +810,33 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         sb.append("【命中源码上下文（共 ").append(matchedSnippets.size()).append(" 个代码文件，源码带行号）】\n\n");
         appendSnippets(sb, matchedSnippets, PROMPT_SNIPPET_CHAR_BUDGET);
 
-        sb.append("【输出格式硬性要求与参考样例】\n");
-        sb.append("请严格遵循以下高密度输出结构，不要输出任何引言、客套话或模板套话：\n\n");
-        sb.append("=== 格式参考示范 ===\n");
-        sb.append("实报费用新增入口是 ScmActualReimbursementController.addReimbursement（POST /add，@Validated），核心实现见 ScmActualReimbursementServiceImpl.java:399-484。校验分四层：\n\n");
-        sb.append("1. DTO 注解校验\n");
-        sb.append("- 明细集合 details 不能为空\n");
-        sb.append("- 备注 ≤200、箱号/提单号 ≤200、特殊费用单号 ≤255、附件 ≤10\n");
-        sb.append("- 金额范围 -999999.99 ~ 999999.99\n\n");
-        sb.append("2. 前置校验 preCheckReimbursement（ScmActualReimbursementServiceImpl.java:263）\n");
-        sb.append("- 非草稿（izDraft=false）：\n");
-        sb.append("  - 物流商必填且必须存在、启用\n");
-        sb.append("  - 明细至少一条\n");
-        sb.append("  - 每条明细：费用项名称、标准费用项（必须存在且停用校验，feeType=实报）、是否供应商责任、费用项类型、金额、币种必填\n");
-        sb.append("  - 非供应商责任时金额不能小于 0.01\n");
-        sb.append("  - 供应商责任=是：责任供应商编码+类型必填，且供应商有效；类型为 PURCHASE 时采购方必填\n");
-        sb.append("  - 供应商责任=否：不能填责任供应商\n");
-        sb.append("  - 特殊费用项：特殊费用单号必填，且「特殊费用单号+二级费用项」在本请求内不重复，是否供应商责任必须为否\n");
-        sb.append("  - 非特殊费用项：不能填特殊费用单号，且「箱号+提单号+二级费用项」在本请求内唯一\n");
-        sb.append("- 草稿：跳过以上全部明细及表头校验（但 DTO 的 details 非空仍生效，物流商可空）\n\n");
-        sb.append("3. 数据库重复校验 checkDatabaseDuplicatesBatch（ScmActualReimbursementServiceImpl.java:1038，仅非草稿）\n");
-        sb.append("- 特殊费用项跳过\n");
-        sb.append("- 供应商责任=是：按「物流商+责任供应商+箱号+提单号+二级费用项」查重\n");
-        sb.append("- 供应商责任=否：按「箱号+提单号+二级费用项」查是否已存在供应商责任=是 的记录（已有供应商承担则不允许再以非供应商责任提交）\n");
-        sb.append("- SQL（ScmActualReimbursementDetailMapper.xml:51）：只排除已作废（status=5），已删除不算\n\n");
-        sb.append("4. 并发与提交\n");
-        sb.append("- 非草稿用 Redis 全局锁 lock:scm:actualReimbursement 防并发\n");
-        sb.append("- 提交后走钉钉审批；审批开关关闭则直接置为已生效并生成采购应付单\n\n");
+        // 格式示范只给结构骨架，不放具体业务内容，避免大模型照抄示范中的字段、规则或行号
+        sb.append("【输出格式硬性要求与结构骨架】\n");
+        sb.append("请严格遵循以下高密度输出结构，不要输出任何引言、客套话或模板套话。骨架中 {} 为占位符，必须替换为上方源码中的真实内容：\n\n");
+        sb.append("=== 结构骨架 ===\n");
+        sb.append("{业务}{动作}入口是 {Controller}.{method}，核心实现见 {ServiceImpl}.java:{起始行}-{结束行}。{逻辑}分 N 步：\n\n");
+        sb.append("1. {第一步名称}（{方法名}，{文件名}.java:{行号}）\n");
+        sb.append("- {具体条件 / 字段 / 状态值 / 报错文案}\n");
+        sb.append("- {分支一}：{该分支的规则}\n");
+        sb.append("- {分支二}：{该分支的规则}\n\n");
+        sb.append("2. {第二步名称}（{方法名}，{文件名}.java:{行号}）\n");
+        sb.append("- {查询条件 / SQL 条件（{Mapper}.xml:{行号}）/ 落库表}\n\n");
         sb.append("可留意的点\n");
-        sb.append("- 草稿仍强制 details 非空，无法保存空草稿。\n");
-        sb.append("- 新增不校验币种是否在字典中（仅导入校验），只要求非空。\n");
-        sb.append("- DB 查重 SQL 只排除作废，待提交/已驳回的历史单据也会拦截新增。\n");
-        sb.append("- checkDatabaseDuplicatesBatch 在 try 内，异常会被包装成「实报新增异常：」前缀。\n");
-        sb.append("- 金额错误文案写的是「预计费用」，实为实报金额。\n");
-        sb.append("=== 格式示范结束 ===\n\n");
+        sb.append("- {源码中能直接看出的业务特例或坑点}\n");
+        sb.append("=== 骨架结束 ===\n\n");
         sb.append("【本次梳理要求】\n");
-        sb.append("1. **第一句直奔主题**：说明核心逻辑集中在 {ServiceImpl}.{method}（:{行号}），结果写入哪张表/用于什么，并说明分几步。\n");
+        sb.append("1. **第一句直奔主题**：说明核心逻辑集中在 {ServiceImpl}.{method}（{文件名}.java:{行号}），结果写入哪张表/用于什么，并说明分几步。\n");
         sb.append("2. **结构化分层拆解**：按业务执行流分点阐述（如 触发场景、读取的配置、分组维度、计算/分摊/匹配规则、聚合与落库、下游使用），"
                 + "必须精确写出具体的方法名、文件行号、字段名、判定条件、状态值、报错条件、关联 SQL/Redis 条件，禁止泛化套话。"
                 + "触发入口只用一行列出（含 Controller 接口与内部调用处），不展开 Controller 的注解、参数与返回值。\n");
         sb.append("3. **可留意的点**：只写业务逻辑上的特例与坑点，最多 3 条，没有就不写。"
                 + "不要评论接口规范（GET/POST、权限注解、@Log、参数校验、返回值类型、方法命名拼写），除非问题明确问到。\n");
         sb.append("4. **直接输出上述内容，严禁任何寒暄、问候、总结前言或后记**。\n");
-        sb.append("6. **源码不足时**：若核心方法体不在上述源码中，用一句话说明缺少哪个类的哪个方法，不要用 Controller 细节或推测填充篇幅。\n");
         sb.append("5. **篇幅与问题匹配**：若问题只是询问简单事实（如有哪些状态、字段、类型、枚举值），直接用列表或表格给出答案并附出处文件，"
                 + "不必套用上述分层结构与「可留意的点」。\n");
+        sb.append("6. **源码不足时**：若核心方法体不在上述源码中，用一句话说明缺少哪个类的哪个方法，不要用 Controller 细节或推测填充篇幅。\n");
+        sb.append("7. **引用必须可核对**：代码位置统一写成「文件名.java:行号」或「文件名.xml:行号」，行号取自源码中的 L 前缀，"
+                + "不得估算；源码中没有出现的类、方法、字段、表名一律不写。\n");
 
         messages.add(OpenChatMessageDTO.builder()
                 .role(ROLE_USER)
@@ -934,6 +945,118 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      */
     private boolean isTableQuestion(String question) {
         return StringUtils.isNotBlank(question) && TABLE_QUESTION_PATTERN.matcher(question).find();
+    }
+
+    /**
+     * 核对报告中的「文件名.java:行号」引用：文件不存在或行号超出文件总行数时，在报告末尾追加提示
+     *
+     * @param report   大模型分析报告
+     * @param repoDir  本地仓库目录
+     * @param snippets 本次提供给大模型的代码片段（优先在其中查找引用的文件）
+     * @return 追加核对提示后的报告
+     */
+    private String appendCitationWarnings(String report, File repoDir, List<YunxiaoCodeSnippetDTO> snippets) {
+        if (StringUtils.isBlank(report) || repoDir == null || !repoDir.isDirectory()) {
+            return report;
+        }
+        Map<String, Integer> citations = new LinkedHashMap<>();
+        Matcher matcher = CODE_CITATION.matcher(report);
+        while (matcher.find()) {
+            int line = Integer.parseInt(matcher.group(Constants.TWO));
+            if (matcher.group(Constants.THREE) != null) {
+                line = Math.max(line, Integer.parseInt(matcher.group(Constants.THREE)));
+            }
+            citations.merge(matcher.group(Constants.ONE), line, Math::max);
+        }
+        if (citations.isEmpty()) {
+            return report;
+        }
+
+        Path root = repoDir.toPath();
+        Map<String, List<Path>> filesByName = new HashMap<>();
+        for (YunxiaoCodeSnippetDTO snippet : snippets) {
+            Path path = root.resolve(snippet.getFilePath()).normalize();
+            filesByName.computeIfAbsent(path.getFileName().toString(), key -> new ArrayList<>()).add(path);
+        }
+        boolean repoIndexed = false;
+
+        List<String> warnings = new ArrayList<>();
+        for (Map.Entry<String, Integer> citation : citations.entrySet()) {
+            String fileName = citation.getKey();
+            int line = citation.getValue();
+            if (!filesByName.containsKey(fileName) && !repoIndexed) {
+                indexRepoFiles(root, filesByName);
+                repoIndexed = true;
+            }
+            List<Path> candidates = filesByName.getOrDefault(fileName, Collections.emptyList());
+            if (candidates.isEmpty()) {
+                warnings.add(fileName + ":" + line + "（分支中不存在该文件）");
+                continue;
+            }
+            int maxLines = candidates.stream().mapToInt(this::countLines).max().orElse(Constants.ZERO);
+            if (line < Constants.ONE || line > maxLines) {
+                warnings.add(fileName + ":" + line + "（行号超出文件总行数 " + maxLines + "）");
+            }
+        }
+        if (warnings.isEmpty()) {
+            return report;
+        }
+
+        log.warn("分析报告中有 {} 处代码引用核对未通过: {}", warnings.size(), warnings);
+        StringBuilder sb = new StringBuilder(report.trim());
+        sb.append("\n\n⚠️ 以下代码引用未能在分支源码中核对通过，请以源码为准：\n");
+        warnings.stream().limit(MAX_CITATION_WARNINGS).forEach(w -> sb.append("- ").append(w).append("\n"));
+        if (warnings.size() > MAX_CITATION_WARNINGS) {
+            sb.append("- ……另有 ").append(warnings.size() - MAX_CITATION_WARNINGS).append(" 处\n");
+        }
+        return sb.toString().trim();
+    }
+
+    /**
+     * 按文件名索引仓库内的源码文件（跳过 .git、target、node_modules 等目录）
+     */
+    private void indexRepoFiles(Path root, Map<String, List<Path>> filesByName) {
+        try {
+            Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
+                    return !dir.equals(root) && CITATION_SKIP_DIRS.contains(name)
+                            ? FileVisitResult.SKIP_SUBTREE : FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    String name = file.getFileName().toString();
+                    if (name.endsWith(".java") || name.endsWith(".xml")) {
+                        List<Path> paths = filesByName.computeIfAbsent(name, key -> new ArrayList<>());
+                        if (!paths.contains(file.normalize())) {
+                            paths.add(file.normalize());
+                        }
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (IOException e) {
+            log.warn("索引仓库文件异常: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 统计文件行数，读取失败时返回 0
+     */
+    private int countLines(Path file) {
+        try {
+            String content = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+            return content.isEmpty() ? Constants.ZERO : content.split("\\r?\\n", -1).length;
+        } catch (IOException e) {
+            return Constants.ZERO;
+        }
     }
 
     /**

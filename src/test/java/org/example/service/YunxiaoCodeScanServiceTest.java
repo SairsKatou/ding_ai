@@ -107,7 +107,7 @@ public class YunxiaoCodeScanServiceTest {
         when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.singletonList(mockRepo));
         when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(new File("."));
-        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyInt()))
+        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyString(), anyInt()))
                 .thenReturn(Collections.emptyList());
         when(yunxiaoAgentToolService.executeTool(eq("find_table_usages"), anyString(), any(File.class)))
                 .thenReturn("■ scm_actual_reimbursement  实体: ScmActualReimbursement  (引用 3 处)\n");
@@ -217,7 +217,7 @@ public class YunxiaoCodeScanServiceTest {
 
         when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(new File("."));
-        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyInt()))
+        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyString(), anyInt()))
                 .thenReturn(Collections.singletonList(mockSnippet));
         when(openCodeService.chat(anyList())).thenReturn("### 方案A本地扫描大模型审计报告\n1. 精准梳理实报业务逻辑");
 
@@ -234,7 +234,58 @@ public class YunxiaoCodeScanServiceTest {
         assertEquals("dev", result.getBranch());
         assertEquals(Constants.ONE, result.getMatchedFileCount());
         assertTrue(result.getAnalysisReport().contains("方案A本地扫描大模型审计报告"));
-        verify(yunxiaoGitCloneService).scanLocalRepository(any(File.class), anyString(), eq(Constants.FIFTY));
+        verify(yunxiaoGitCloneService).scanLocalRepository(any(File.class), anyString(), anyString(), eq(Constants.FIFTY));
+    }
+
+    /**
+     * 测试分析报告引用核对：行号超出文件总行数、文件不存在时追加提示；Prompt 不再包含具体业务示范
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testScanAndAnalyzeBranchCitationCheck() throws Exception {
+        java.nio.file.Path repoDir = java.nio.file.Files.createTempDirectory("citation-repo");
+        java.nio.file.Path serviceFile = repoDir.resolve("service/DemoServiceImpl.java");
+        java.nio.file.Files.createDirectories(serviceFile.getParent());
+        java.nio.file.Files.writeString(serviceFile, "line1\nline2\nline3\nline4\nline5\n", StandardCharsets.UTF_8);
+        // deleteOnExit 按注册的逆序删除：先文件、再子目录、最后根目录
+        repoDir.toFile().deleteOnExit();
+        serviceFile.getParent().toFile().deleteOnExit();
+        serviceFile.toFile().deleteOnExit();
+
+        YunxiaoRepositoryDTO mockRepo = YunxiaoRepositoryDTO.builder()
+                .id(6120951L)
+                .name("changtai-cloud")
+                .httpUrlToRepo("https://codeup.aliyun.com/mock/changtai-cloud.git")
+                .build();
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.singletonList(mockRepo));
+        when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(repoDir.toFile());
+        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyString(), anyInt()))
+                .thenReturn(Collections.singletonList(YunxiaoCodeSnippetDTO.builder()
+                        .filePath("service/DemoServiceImpl.java")
+                        .snippet("L1: line1")
+                        .build()));
+        when(openCodeService.chat(anyList())).thenReturn(
+                "核心实现见 DemoServiceImpl.java:3，校验在 DemoServiceImpl.java:2-80，SQL 见 DemoMapper.xml：12");
+
+        YunxiaoCodeScanParam param = YunxiaoCodeScanParam.builder()
+                .repositoryId("changtai-cloud")
+                .branch("dev")
+                .question("梳理调拨单新增的校验逻辑")
+                .build();
+        String report = yunxiaoCodeScanService.scanAndAnalyzeBranch(param).getAnalysisReport();
+
+        assertTrue(report.startsWith("核心实现见 DemoServiceImpl.java:3"));
+        assertTrue(report.contains("DemoServiceImpl.java:80（行号超出文件总行数"));
+        assertTrue(report.contains("DemoMapper.xml:12（分支中不存在该文件）"));
+        assertFalse(report.contains("DemoServiceImpl.java:3（"));
+
+        ArgumentCaptor<List<OpenChatMessageDTO>> captor = ArgumentCaptor.forClass(List.class);
+        verify(openCodeService).chat(captor.capture());
+        String userPrompt = captor.getValue().get(Constants.ONE).getContent();
+        assertTrue(userPrompt.contains("结构骨架"));
+        assertFalse(userPrompt.contains("preCheckReimbursement"));
+        assertFalse(userPrompt.contains("checkDatabaseDuplicatesBatch"));
     }
 
     /**

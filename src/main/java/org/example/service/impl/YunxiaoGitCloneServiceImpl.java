@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.example.config.YunxiaoProperties;
+import org.example.domain.dto.CodeSearchTermsDTO;
 import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 import org.example.domain.dto.YunxiaoRepoCacheMetadata;
 import org.example.domain.dto.YunxiaoRepositoryDTO;
@@ -13,6 +14,8 @@ import org.example.domain.dto.YunxiaoRepositoryQueryParam;
 import org.example.service.CodeSearchKeywordService;
 import org.example.service.YunxiaoDevopsService;
 import org.example.service.YunxiaoGitCloneService;
+import org.example.util.CodeTokenMatcher;
+import org.example.util.JavaSourceParser;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
@@ -31,6 +34,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
@@ -88,15 +92,50 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     private static final double PATH_HIT_BONUS = 2.0;
 
     /**
-     * 命中关键词的方法声明行得分加成
+     * 方法名命中关键词时的得分加成
      */
     private static final double DECLARATION_BOOST = 3.0;
 
     /**
-     * Java 方法声明行
+     * 文件路径命中业务实体词、且声明了动作方法（如 addReimbursement）时的得分倍数
      */
-    private static final Pattern METHOD_DECLARATION = Pattern.compile(
-            "^\\s*(?:public|private|protected)\\s+(?:static\\s+)?(?:final\\s+)?[\\w<>\\[\\],.?\\s]+\\s+(\\w+)\\s*\\(");
+    private static final double ACTION_COMBO_FACTOR = 1.5;
+
+    /**
+     * 问题不涉及前端时，前端文件（.vue/.js/.ts）的得分倍数
+     */
+    private static final double FRONTEND_PENALTY = 0.3;
+
+    /**
+     * 被相关方法调用的同类方法，按调用方得分的该比例纳入片段
+     */
+    private static final double CALLEE_SCORE_RATIO = 0.5;
+
+    /**
+     * 长方法拆分后，方法内命中行窗口相对方法得分的比例（低于方法头）
+     */
+    private static final double SPLIT_SCORE_RATIO = 0.9;
+
+    /**
+     * BM25 IDF 平滑项
+     */
+    private static final double IDF_SMOOTHING = 0.5;
+
+    /**
+     * 同类方法调用：foo( 或 this.foo(
+     */
+    private static final Pattern METHOD_CALL = Pattern.compile("(?:(?<![\\w$.])|(?<=\\bthis\\.))([a-z_$][\\w$]*)\\s*\\(");
+
+    /**
+     * 问题涉及测试代码
+     */
+    private static final Pattern TEST_QUESTION_PATTERN = Pattern.compile("测试|单测|单元测试|test", Pattern.CASE_INSENSITIVE);
+
+    /**
+     * 问题涉及前端代码
+     */
+    private static final Pattern FRONTEND_QUESTION_PATTERN = Pattern.compile(
+            "前端|页面|界面|按钮|弹窗|表单|列表页|组件|vue|\\bjs\\b|\\bts\\b", Pattern.CASE_INSENSITIVE);
 
     @Resource
     private YunxiaoProperties yunxiaoProperties;
@@ -188,37 +227,45 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
      *
      * @param repoDir       本地仓库根目录
      * @param searchKeyword 搜索业务关键词
+     * @param question      用户原始提问（用于补充检索词、动作词与文件类型过滤）
      * @param maxFiles      最大提取相关文件数
      * @return 命中的代码片段列表
      */
     @Override
-    public List<YunxiaoCodeSnippetDTO> scanLocalRepository(File repoDir, String searchKeyword, int maxFiles) {
+    public List<YunxiaoCodeSnippetDTO> scanLocalRepository(File repoDir, String searchKeyword, String question, int maxFiles) {
         if (repoDir == null || !repoDir.exists() || !repoDir.isDirectory()) {
             return Collections.emptyList();
         }
 
-        Set<String> searchTokens = new HashSet<>(codeSearchKeywordService.buildSearchTokens(searchKeyword, searchKeyword));
+        String fullQuestion = StringUtils.defaultIfBlank(question, searchKeyword);
+        Set<String> searchTokens = new HashSet<>(codeSearchKeywordService.buildSearchTokens(searchKeyword, fullQuestion));
+        Set<String> actionTokens = new HashSet<>(codeSearchKeywordService.resolveActionTokens(fullQuestion));
+        boolean includeTests = TEST_QUESTION_PATTERN.matcher(fullQuestion).find();
+        boolean frontendQuestion = FRONTEND_QUESTION_PATTERN.matcher(fullQuestion).find();
         List<FileMatch> matches = new ArrayList<>();
+        int candidateCount = Constants.ZERO;
 
-        // 1. 毫秒级遍历本地全量文件树
+        // 1. 毫秒级遍历本地全量文件树（问题不涉及测试时排除测试代码）
         try (Stream<Path> stream = Files.walk(repoDir.toPath())) {
             List<File> candidates = stream
                     .filter(Files::isRegularFile)
                     .map(Path::toFile)
                     .filter(this::isAllowedCodeFile)
+                    .filter(file -> includeTests || !isTestFile(getRelativePath(repoDir, file)))
                     .collect(Collectors.toList());
+            candidateCount = candidates.size();
 
-            log.info("本地工程源码文件检索完毕，待扫描源码文件总数: {}", candidates.size());
+            log.info("本地工程源码文件检索完毕，待扫描源码文件总数: {}", candidateCount);
 
             // 2. 内存全文扫描，统计每个 Token 在路径与内容中的命中情况
             matches = collectMatches(repoDir, candidates, searchTokens);
 
-            // 3. 若初次检索未命中任何文件，借助大模型语义推理推断英文 token 进行二次兜底检索
-            if (matches.isEmpty()) {
-                Set<String> aiTokens = codeSearchKeywordService.inferEnglishTokensWithAI(searchKeyword);
-                if (CollectionUtils.isNotEmpty(aiTokens)) {
-                    log.info("初次扫描未命中，补充大模型推断英文 Token 二次检索: {}", aiTokens);
-                    searchTokens.addAll(aiTokens);
+            // 3. 业务字典未覆盖、无命中或无文件路径命中时，借助大模型推断英文实体词与动作词补充检索
+            if (needsAiTerms(searchTokens, matches)) {
+                CodeSearchTermsDTO aiTerms = codeSearchKeywordService.inferSearchTermsWithAI(fullQuestion);
+                actionTokens.addAll(aiTerms.getActionTokens());
+                if (searchTokens.addAll(aiTerms.getEntityTokens())) {
+                    log.info("补充大模型推断实体 Token 二次检索: {}", aiTerms.getEntityTokens());
                     matches = collectMatches(repoDir, candidates, searchTokens);
                 }
             }
@@ -226,20 +273,27 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
             log.error("本地文件扫描异常: {}", e.getMessage(), e);
         }
 
-        log.info("本地全量匹配完成，命中关键词 [{}] 的源码文件总数: {}", searchKeyword, matches.size());
+        log.info("本地全量匹配完成，命中关键词 [{}] 的源码文件总数: {}，动作词: {}", searchKeyword, matches.size(), actionTokens);
 
-        // 4. 按相关度排序：命中越专属的 Token（如 拆分/spilt）得分越高，泛化 Token（如 statement/bill）得分低；
+        // 4. 按相关度排序：IDF 以全部候选文件为基数，命中越专属的 Token 得分越高，泛化 Token（如 log/statement）接近 0；
+        //    路径命中实体词且声明了动作方法（如 addReimbursement）的文件额外加权；问题不涉及前端时前端文件降权；
         //    同分时路径命中优先，再按 Controller > Service > Mapper/XML > 其他
-        Map<String, Double> tokenWeights = computeTokenWeights(searchTokens, matches);
+        Map<String, Double> tokenWeights = computeTokenWeights(searchTokens, matches, candidateCount);
         for (FileMatch match : matches) {
             match.score = scoreMatch(match, tokenWeights);
+            if (!match.pathTokens.isEmpty() && hasActionDeclaration(match.file, actionTokens)) {
+                match.score *= ACTION_COMBO_FACTOR;
+            }
+            if (!frontendQuestion && isFrontendFile(match.relativePath)) {
+                match.score *= FRONTEND_PENALTY;
+            }
         }
         matches.sort(Comparator.comparingDouble((FileMatch m) -> -m.score)
                 .thenComparing(m -> m.pathTokens.isEmpty())
                 .thenComparingInt(m -> layerOrder(m.relativePath)));
         if (!matches.isEmpty()) {
             log.info("相关度最高的文件: {}", matches.stream().limit(Constants.FIVE)
-                    .map(m -> m.relativePath + "(" + String.format("%.1f", m.score) + ")")
+                    .map(m -> m.relativePath + "(" + String.format("%.2f", m.score) + ")")
                     .collect(Collectors.joining(", ")));
         }
 
@@ -255,7 +309,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
                 // 相关度第 1 的文件通常是核心实现类，给 4 倍长度；第 2~3 个给 2 倍
                 int maxChars = i == Constants.ZERO ? MAX_SNIPPET_CHARS * Constants.FOUR
                         : (i < TOP_SNIPPET_FILES ? MAX_SNIPPET_CHARS * Constants.TWO : MAX_SNIPPET_CHARS);
-                String snippet = extractLocalSnippet(content, tokenWeights, maxChars);
+                String snippet = extractLocalSnippet(content, relativePath, tokenWeights, actionTokens, maxChars);
 
                 snippets.add(YunxiaoCodeSnippetDTO.builder()
                         .filePath(relativePath)
@@ -268,6 +322,50 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
         }
 
         return snippets;
+    }
+
+    /**
+     * 判断是否需要借助大模型补充检索词：没有英文 Token、没有命中文件、或没有任何文件路径命中
+     */
+    private boolean needsAiTerms(Set<String> searchTokens, List<FileMatch> matches) {
+        boolean hasEnglish = searchTokens.stream().anyMatch(token -> token.matches("[a-z0-9_]+"));
+        boolean hasPathHit = matches.stream().anyMatch(m -> !m.pathTokens.isEmpty());
+        return !hasEnglish || matches.isEmpty() || !hasPathHit;
+    }
+
+    /**
+     * 是否为测试代码
+     */
+    private boolean isTestFile(String relativePath) {
+        String path = relativePath.toLowerCase();
+        String name = path.substring(path.lastIndexOf('/') + Constants.ONE);
+        return path.startsWith("src/test/") || path.contains("/src/test/")
+                || name.endsWith("test.java") || name.endsWith("tests.java")
+                || name.contains(".spec.") || name.contains(".test.");
+    }
+
+    /**
+     * 是否为前端代码
+     */
+    private boolean isFrontendFile(String relativePath) {
+        String path = relativePath.toLowerCase();
+        return path.endsWith(".vue") || path.endsWith(".js") || path.endsWith(".ts");
+    }
+
+    /**
+     * Java 文件中是否声明了方法名包含动作词的方法（如 addReimbursement、preCheckReimbursement）
+     */
+    private boolean hasActionDeclaration(File file, Set<String> actionTokens) {
+        if (actionTokens.isEmpty() || !file.getName().endsWith(".java")) {
+            return false;
+        }
+        try {
+            String[] lines = readContent(file).split("\r?\n");
+            return JavaSourceParser.listMethods(lines).stream()
+                    .anyMatch(method -> actionTokens.stream().anyMatch(action -> CodeTokenMatcher.contains(method.name(), action)));
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     /**
@@ -334,7 +432,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     }
 
     /**
-     * 统计每个候选文件在路径与内容中命中的 Token 及次数
+     * 统计每个候选文件在路径与内容中命中的 Token 及次数（英文 Token 按词边界匹配，避免 log 命中 catalog）
      *
      * @param repoDir      仓库根目录
      * @param candidates   候选文件
@@ -346,19 +444,19 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
         for (File file : candidates) {
             String relativePath = getRelativePath(repoDir, file);
             FileMatch match = new FileMatch(file, relativePath);
-            String lowerPath = relativePath.toLowerCase();
-            String lowerContent;
+            String content;
             try {
-                lowerContent = readContent(file).toLowerCase();
+                content = readContent(file);
             } catch (Exception e) {
                 log.debug("读取本地文件失败, 已跳过: {}", relativePath);
                 continue;
             }
+            String lowerContent = content.toLowerCase();
             for (String token : searchTokens) {
-                if (lowerPath.contains(token)) {
+                if (CodeTokenMatcher.contains(relativePath, token)) {
                     match.pathTokens.add(token);
                 }
-                int count = countOccurrences(lowerContent, token);
+                int count = CodeTokenMatcher.countMatches(content, lowerContent, token);
                 if (count > Constants.ZERO) {
                     match.contentCounts.put(token, count);
                 }
@@ -371,20 +469,22 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     }
 
     /**
-     * 计算 Token 权重（IDF）：命中文件越少的 Token 越专属、权重越高
+     * 计算 Token 权重（BM25 IDF，以全部候选文件为基数）：命中文件越少越专属；几乎每个文件都命中的泛化 Token 权重接近 0
      *
-     * @param searchTokens 检索 Token
-     * @param matches      命中文件
+     * @param searchTokens   检索 Token
+     * @param matches        命中文件
+     * @param candidateCount 候选文件总数
      * @return Token -> 权重
      */
-    private Map<String, Double> computeTokenWeights(Set<String> searchTokens, List<FileMatch> matches) {
+    private Map<String, Double> computeTokenWeights(Set<String> searchTokens, List<FileMatch> matches, int candidateCount) {
         Map<String, Double> weights = new HashMap<>();
+        double total = Math.max(candidateCount, matches.size());
         for (String token : searchTokens) {
             long df = matches.stream()
                     .filter(m -> m.pathTokens.contains(token) || m.contentCounts.containsKey(token))
                     .count();
             if (df > Constants.ZERO) {
-                weights.put(token, Math.log(Constants.ONE + (double) matches.size() / df));
+                weights.put(token, Math.log(Constants.ONE + (total - df + IDF_SMOOTHING) / (df + IDF_SMOOTHING)));
             }
         }
         return weights;
@@ -405,32 +505,16 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     }
 
     /**
-     * 文本得分：文本中包含的 Token 权重之和
+     * 文本得分：文本中按词边界包含的 Token 权重之和
      */
-    private double scoreText(String lowerText, Map<String, Double> tokenWeights) {
+    private double scoreText(String text, Map<String, Double> tokenWeights) {
         double score = Constants.ZERO;
         for (Map.Entry<String, Double> entry : tokenWeights.entrySet()) {
-            if (lowerText.contains(entry.getKey())) {
+            if (CodeTokenMatcher.contains(text, entry.getKey())) {
                 score += entry.getValue();
             }
         }
         return score;
-    }
-
-    /**
-     * 统计子串出现次数
-     */
-    private int countOccurrences(String text, String token) {
-        if (StringUtils.isEmpty(token)) {
-            return Constants.ZERO;
-        }
-        int count = Constants.ZERO;
-        int index = text.indexOf(token);
-        while (index >= Constants.ZERO) {
-            count++;
-            index = text.indexOf(token, index + token.length());
-        }
-        return count;
     }
 
     /**
@@ -458,14 +542,18 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
     }
 
     /**
-     * 提取本地代码上下文片段：优先截取命中专属 Token 最多的代码行附近，跳过 import/package 行
+     * 提取本地代码上下文片段：Java 文件按方法整体截取（命中行所在方法 + 被其调用的同类方法），
+     * 其他文件取命中行附近窗口；跳过 import/package 行
      *
      * @param content      完整代码
+     * @param relativePath 文件相对路径
      * @param tokenWeights Token 权重
+     * @param actionTokens 动作词
      * @param maxChars     片段最大字符数
      * @return 截取后的代码片段
      */
-    private String extractLocalSnippet(String content, Map<String, Double> tokenWeights, int maxChars) {
+    private String extractLocalSnippet(String content, String relativePath, Map<String, Double> tokenWeights,
+                                       Set<String> actionTokens, int maxChars) {
         String[] lines = content.split("\r?\n");
         if (content.length() <= Constants.FOUR_THOUSAND) {
             // 短文件保留全文，同样附带行号，保证大模型引用的行号准确
@@ -477,9 +565,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
         }
 
         // 1. 为每个命中行打分：行内命中 Token 的权重之和（import/package 行不计分，避免片段被导包占满）
-        List<Integer> hitLines = new ArrayList<>();
         double[] lineScores = new double[lines.length];
-        boolean[] declarationHits = new boolean[lines.length];
         boolean[] importLines = new boolean[lines.length];
         for (int i = Constants.ZERO; i < lines.length; i++) {
             String trimmed = lines[i].trim();
@@ -487,50 +573,17 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
                 importLines[i] = true;
                 continue;
             }
-            lineScores[i] = scoreText(lines[i].toLowerCase(), tokenWeights);
-            if (lineScores[i] > Constants.ZERO) {
-                // 方法名命中关键词（如 generateSplitData）通常是业务主干，按方法名计分并优先纳入，
-                // 避免参数类型中的泛化 Token（如 ScmHeadStatementAccountDetail）抬高无关方法
-                Matcher declaration = METHOD_DECLARATION.matcher(lines[i]);
-                if (declaration.find()) {
-                    double nameScore = scoreText(declaration.group(Constants.ONE).toLowerCase(), tokenWeights);
-                    if (nameScore > Constants.ZERO) {
-                        lineScores[i] = nameScore * DECLARATION_BOOST;
-                        declarationHits[i] = true;
-                    }
-                }
-                hitLines.add(i);
-            }
+            lineScores[i] = scoreText(lines[i], tokenWeights);
         }
 
-        // 2. 按行得分从高到低依次纳入「命中行 ± 15 行」窗口，直到达到长度上限
-        hitLines.sort(Comparator.comparingDouble((Integer i) -> -lineScores[i]));
+        // 2. 构建候选片段：Java 文件以方法为单位，其他文件以命中行 ± 15 行为窗口
+        List<SnippetSegment> segments = relativePath.endsWith(".java")
+                ? buildMethodSegments(lines, lineScores, tokenWeights, actionTokens)
+                : buildWindowSegments(lines, lineScores, null, Constants.FIFTEEN);
+
+        // 3. 按得分从高到低纳入，直到达到长度上限；放不下的长方法退化为「方法头 + 方法内命中行窗口」
         Set<Integer> selected = new TreeSet<>();
-        int selectedChars = Constants.ZERO;
-        boolean truncated = false;
-        for (Integer center : hitLines) {
-            // 方法声明向下多取，覆盖方法体开头的主流程；普通命中行取前后 15 行
-            boolean declaration = declarationHits[center];
-            int start = Math.max(Constants.ZERO, center - (declaration ? Constants.THREE : Constants.FIFTEEN));
-            int end = Math.min(lines.length - Constants.ONE, center + (declaration ? Constants.FIFTY : Constants.FIFTEEN));
-            int windowChars = Constants.ZERO;
-            // 窗口内的 import/package 行同样不纳入
-            for (int k = start; k <= end; k++) {
-                if (!importLines[k] && !selected.contains(k)) {
-                    windowChars += lines[k].length() + Constants.EIGHT;
-                }
-            }
-            if (selectedChars + windowChars > maxChars) {
-                truncated = true;
-                break;
-            }
-            for (int k = start; k <= end; k++) {
-                if (!importLines[k]) {
-                    selected.add(k);
-                }
-            }
-            selectedChars += windowChars;
-        }
+        boolean truncated = selectSegments(segments, lines, lineScores, importLines, selected, maxChars);
         if (selected.isEmpty()) {
             // 无行级命中（仅路径命中）时取前 100 行
             for (int i = Constants.ZERO; i < Math.min(lines.length, Constants.HUNDRED); i++) {
@@ -538,7 +591,7 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
             }
         }
 
-        // 3. 按行号顺序输出，附带行号方便大模型精准定位
+        // 4. 按行号顺序输出，附带行号方便大模型精准定位
         StringBuilder result = new StringBuilder();
         int prev = -Constants.ONE;
         for (Integer idx : selected) {
@@ -552,6 +605,169 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
             result.append("// ... [片段过长已截断，仅保留与关键词最相关的代码] ...");
         }
         return result.toString().stripTrailing();
+    }
+
+    /**
+     * Java 文件按方法构建候选片段：
+     * 方法得分 = max(方法名命中得分 × 声明加成, 方法体内最高行得分)，方法名含动作词时再加权；
+     * 相关方法调用的同类方法按调用方得分的一半纳入（只追一层）；方法外的命中行（字段、类声明）取 ± 3 行小窗口
+     */
+    private List<SnippetSegment> buildMethodSegments(String[] lines, double[] lineScores,
+                                                     Map<String, Double> tokenWeights, Set<String> actionTokens) {
+        List<JavaSourceParser.MethodRange> methods = JavaSourceParser.listMethods(lines);
+        if (methods.isEmpty()) {
+            return buildWindowSegments(lines, lineScores, null, Constants.FIFTEEN);
+        }
+
+        double[] methodScores = new double[methods.size()];
+        boolean[] inMethod = new boolean[lines.length];
+        Map<String, List<Integer>> methodsByName = new HashMap<>();
+        for (int m = Constants.ZERO; m < methods.size(); m++) {
+            JavaSourceParser.MethodRange method = methods.get(m);
+            methodsByName.computeIfAbsent(method.name(), key -> new ArrayList<>()).add(m);
+            double maxLineScore = Constants.ZERO;
+            for (int i = method.startLine(); i <= method.endLine(); i++) {
+                inMethod[i] = true;
+                maxLineScore = Math.max(maxLineScore, lineScores[i]);
+            }
+            double score = Math.max(scoreText(method.name(), tokenWeights) * DECLARATION_BOOST, maxLineScore);
+            if (score > Constants.ZERO
+                    && actionTokens.stream().anyMatch(action -> CodeTokenMatcher.contains(method.name(), action))) {
+                score *= ACTION_COMBO_FACTOR;
+            }
+            methodScores[m] = score;
+        }
+
+        // 追一层调用：校验、落库等逻辑常拆在私有方法里，方法名不一定包含关键词
+        double[] finalScores = methodScores.clone();
+        for (int m = Constants.ZERO; m < methods.size(); m++) {
+            if (methodScores[m] <= Constants.ZERO) {
+                continue;
+            }
+            JavaSourceParser.MethodRange caller = methods.get(m);
+            for (int i = caller.declarationLine() + Constants.ONE; i <= caller.endLine(); i++) {
+                Matcher call = METHOD_CALL.matcher(lines[i]);
+                while (call.find()) {
+                    for (Integer callee : methodsByName.getOrDefault(call.group(Constants.ONE), Collections.emptyList())) {
+                        if (callee != m) {
+                            finalScores[callee] = Math.max(finalScores[callee], methodScores[m] * CALLEE_SCORE_RATIO);
+                        }
+                    }
+                }
+            }
+        }
+
+        List<SnippetSegment> segments = new ArrayList<>();
+        for (int m = Constants.ZERO; m < methods.size(); m++) {
+            if (finalScores[m] > Constants.ZERO) {
+                JavaSourceParser.MethodRange method = methods.get(m);
+                segments.add(new SnippetSegment(method.startLine(), method.endLine(), finalScores[m], method));
+            }
+        }
+        segments.addAll(buildWindowSegments(lines, lineScores, inMethod, Constants.THREE));
+        return segments;
+    }
+
+    /**
+     * 以命中行为中心构建 ± radius 行窗口
+     *
+     * @param excluded 不作为窗口中心的行（如已由方法片段覆盖），可为 null
+     */
+    private List<SnippetSegment> buildWindowSegments(String[] lines, double[] lineScores, boolean[] excluded, int radius) {
+        List<SnippetSegment> segments = new ArrayList<>();
+        for (int i = Constants.ZERO; i < lines.length; i++) {
+            if (lineScores[i] > Constants.ZERO && (excluded == null || !excluded[i])) {
+                segments.add(new SnippetSegment(Math.max(Constants.ZERO, i - radius),
+                        Math.min(lines.length - Constants.ONE, i + radius), lineScores[i], null));
+            }
+        }
+        return segments;
+    }
+
+    /**
+     * 按得分从高到低纳入片段，直到达到长度上限
+     *
+     * @return 是否有相关片段因长度上限被舍弃
+     */
+    private boolean selectSegments(List<SnippetSegment> segments, String[] lines, double[] lineScores,
+                                   boolean[] importLines, Set<Integer> selected, int maxChars) {
+        PriorityQueue<SnippetSegment> queue = new PriorityQueue<>(
+                Comparator.comparingDouble((SnippetSegment s) -> -s.score).thenComparingInt(s -> s.start));
+        queue.addAll(segments);
+        int selectedChars = Constants.ZERO;
+        boolean truncated = false;
+        while (!queue.isEmpty()) {
+            SnippetSegment segment = queue.poll();
+            // 每行额外计入行号前缀，每个片段额外计入一个省略标记，保证输出不超过上限
+            int cost = Constants.ZERO;
+            for (int k = segment.start; k <= segment.end; k++) {
+                if (!importLines[k] && !selected.contains(k)) {
+                    cost += lines[k].length() + Constants.TEN;
+                }
+            }
+            if (cost == Constants.ZERO) {
+                continue;
+            }
+            cost += Constants.THIRTY;
+            if (selectedChars + cost > maxChars) {
+                truncated = true;
+                if (segment.method != null) {
+                    queue.addAll(splitMethod(segment, lines, lineScores));
+                }
+                continue;
+            }
+            for (int k = segment.start; k <= segment.end; k++) {
+                if (!importLines[k]) {
+                    selected.add(k);
+                }
+            }
+            selectedChars += cost;
+        }
+        return truncated;
+    }
+
+    /**
+     * 方法体超出长度上限时拆分为：方法头（注解 + 声明 + 前 30 行主流程）与方法内命中行 ± 15 行窗口
+     */
+    private List<SnippetSegment> splitMethod(SnippetSegment segment, String[] lines, double[] lineScores) {
+        JavaSourceParser.MethodRange method = segment.method;
+        int headEnd = Math.min(method.endLine(), method.declarationLine() + Constants.THIRTY);
+        List<SnippetSegment> parts = new ArrayList<>();
+        parts.add(new SnippetSegment(method.startLine(), headEnd, segment.score, null));
+
+        double maxLineScore = Constants.ZERO;
+        for (int i = headEnd + Constants.ONE; i <= method.endLine(); i++) {
+            maxLineScore = Math.max(maxLineScore, lineScores[i]);
+        }
+        for (int i = headEnd + Constants.ONE; i <= method.endLine() && maxLineScore > Constants.ZERO; i++) {
+            if (lineScores[i] > Constants.ZERO) {
+                parts.add(new SnippetSegment(Math.max(headEnd + Constants.ONE, i - Constants.FIFTEEN),
+                        Math.min(method.endLine(), i + Constants.FIFTEEN),
+                        segment.score * SPLIT_SCORE_RATIO * lineScores[i] / maxLineScore, null));
+            }
+        }
+        return parts;
+    }
+
+    /**
+     * 候选代码片段（行下标从 0 开始，含首尾）
+     */
+    private static final class SnippetSegment {
+
+        private final int start;
+        private final int end;
+        private final double score;
+        /**
+         * 片段对应的完整方法，窗口片段为 null
+         */
+        private final JavaSourceParser.MethodRange method;
+
+        private SnippetSegment(int start, int end, double score, JavaSourceParser.MethodRange method) {
+            this.start = start;
+            this.end = end;
+            this.score = score;
+            this.method = method;
+        }
     }
 
     /**

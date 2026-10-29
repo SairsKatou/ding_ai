@@ -8,6 +8,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.example.domain.dto.OpenChatFunctionDTO;
 import org.example.domain.dto.OpenChatToolDTO;
 import org.example.service.YunxiaoAgentToolService;
+import org.example.util.JavaSourceParser;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedReader;
@@ -126,17 +127,6 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
     private static final Pattern MAPPER_STATEMENT = Pattern.compile(
             "<(select|insert|update|delete)\\b[^>]*?\\bid\\s*=\\s*\"([^\"]+)\"");
     private static final Pattern INCLUDE_REFID = Pattern.compile("<include\\s+[^>]*refid\\s*=\\s*\"([^\"]+)\"");
-
-    /**
-     * 方法声明行中方法名之前不应出现的字符（排除赋值、调用、return 等语句）
-     */
-    private static final Pattern NON_DECLARATION_PREFIX = Pattern.compile(
-            "[=.(!:+\"]|->|&&|\\|\\||//|^\\*|\\b(?:return|new|throw|if|while|for|switch|catch|else)\\b");
-
-    /**
-     * 与方法写在同一行的注解，如 @GetMapping("/list")
-     */
-    private static final Pattern INLINE_ANNOTATION = Pattern.compile("@\\w+(?:\\s*\\([^)]*\\))?");
 
     /**
      * XML 注释
@@ -843,9 +833,9 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
         List<int[]> ranges = new ArrayList<>();
         for (int i = Constants.ZERO; i < lines.length && ranges.size() <= MAX_METHOD_MATCHES; i++) {
             Matcher matcher = declaration.matcher(lines[i]);
-            if (matcher.find() && isMethodDeclaration(lines[i].substring(Constants.ZERO, matcher.start()))) {
-                int end = findMethodEnd(lines, i);
-                ranges.add(new int[]{findDeclarationStart(lines, i), end});
+            if (matcher.find() && JavaSourceParser.isMethodDeclaration(lines[i].substring(Constants.ZERO, matcher.start()))) {
+                int end = JavaSourceParser.findMethodEnd(lines, i);
+                ranges.add(new int[]{JavaSourceParser.findDeclarationStart(lines, i), end});
                 i = end;
             }
         }
@@ -864,84 +854,6 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
             appendNumberedLines(sb, lines, range[0], range[1], MAX_METHOD_LINES);
         }
         return sb.toString();
-    }
-
-    /**
-     * 根据方法名之前的内容判断是否是声明（而非调用、赋值、return 语句或注释）
-     */
-    private boolean isMethodDeclaration(String prefix) {
-        String declarationPrefix = INLINE_ANNOTATION.matcher(prefix).replaceAll("").trim();
-        return !declarationPrefix.isEmpty() && !NON_DECLARATION_PREFIX.matcher(declarationPrefix).find();
-    }
-
-    /**
-     * 向上包含方法的注解与注释
-     */
-    private int findDeclarationStart(String[] lines, int declarationLine) {
-        int start = declarationLine;
-        for (int i = declarationLine - Constants.ONE; i >= Constants.ZERO && declarationLine - i <= Constants.THIRTY; i--) {
-            String line = lines[i].trim();
-            if (line.isEmpty() || line.endsWith(";") || line.endsWith("{") || line.endsWith("}")) {
-                break;
-            }
-            start = i;
-        }
-        return start;
-    }
-
-    /**
-     * 从方法声明行开始匹配大括号，返回方法结束行（跳过字符串、字符与注释中的括号）
-     */
-    private int findMethodEnd(String[] lines, int declarationLine) {
-        int depth = Constants.ZERO;
-        boolean bodyStarted = false;
-        boolean inBlockComment = false;
-        for (int i = declarationLine; i < lines.length; i++) {
-            String line = lines[i];
-            for (int j = Constants.ZERO; j < line.length(); j++) {
-                char c = line.charAt(j);
-                if (inBlockComment) {
-                    if (c == '*' && j + Constants.ONE < line.length() && line.charAt(j + Constants.ONE) == '/') {
-                        inBlockComment = false;
-                        j++;
-                    }
-                } else if (c == '/' && j + Constants.ONE < line.length() && line.charAt(j + Constants.ONE) == '/') {
-                    break;
-                } else if (c == '/' && j + Constants.ONE < line.length() && line.charAt(j + Constants.ONE) == '*') {
-                    inBlockComment = true;
-                    j++;
-                } else if (c == '"' || c == '\'') {
-                    j = skipQuoted(line, j, c);
-                } else if (c == ';' && !bodyStarted) {
-                    // 接口 / 抽象方法没有方法体
-                    return i;
-                } else if (c == '{') {
-                    depth++;
-                    bodyStarted = true;
-                } else if (c == '}') {
-                    depth--;
-                    if (bodyStarted && depth == Constants.ZERO) {
-                        return i;
-                    }
-                }
-            }
-        }
-        return lines.length - Constants.ONE;
-    }
-
-    /**
-     * 跳过字符串或字符字面量，返回结束引号下标
-     */
-    private int skipQuoted(String line, int start, char quote) {
-        for (int i = start + Constants.ONE; i < line.length(); i++) {
-            char c = line.charAt(i);
-            if (c == '\\') {
-                i++;
-            } else if (c == quote) {
-                return i;
-            }
-        }
-        return line.length();
     }
 
     /**

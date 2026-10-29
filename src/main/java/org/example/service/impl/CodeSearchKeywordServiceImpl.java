@@ -3,6 +3,7 @@ package org.example.service.impl;
 import com.ct.common.core.constant.Constants;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.example.domain.dto.CodeSearchTermsDTO;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.service.CodeSearchKeywordService;
 import org.example.service.OpenCodeService;
@@ -13,6 +14,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -110,6 +113,44 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
         BUSINESS_DICT.put("日志", Arrays.asList("log", "operation_log"));
     }
 
+    // 动作词典：仅用于方法名打分，不参与文件检索（add/list 等在代码中过于常见）
+    private static final Map<String, List<String>> ACTION_DICT = new LinkedHashMap<>();
+
+    static {
+        ACTION_DICT.put("新增", Arrays.asList("add", "save", "insert", "create"));
+        ACTION_DICT.put("添加", Arrays.asList("add", "save", "insert"));
+        ACTION_DICT.put("创建", Arrays.asList("create", "add", "save"));
+        ACTION_DICT.put("保存", Arrays.asList("save", "add"));
+        ACTION_DICT.put("修改", Arrays.asList("update", "edit", "modify"));
+        ACTION_DICT.put("编辑", Arrays.asList("update", "edit", "modify"));
+        ACTION_DICT.put("更新", Arrays.asList("update", "modify", "refresh"));
+        ACTION_DICT.put("删除", Arrays.asList("delete", "remove"));
+        ACTION_DICT.put("查询", Arrays.asList("list", "query", "page", "search", "select"));
+        ACTION_DICT.put("列表", Arrays.asList("list", "page"));
+        ACTION_DICT.put("分页", Arrays.asList("page", "list"));
+        ACTION_DICT.put("详情", Arrays.asList("detail", "info"));
+        ACTION_DICT.put("审核", Arrays.asList("audit", "approve", "review"));
+        ACTION_DICT.put("审批", Arrays.asList("approve", "audit", "approval"));
+        ACTION_DICT.put("驳回", Arrays.asList("reject"));
+        ACTION_DICT.put("提交", Arrays.asList("submit", "commit"));
+        ACTION_DICT.put("作废", Arrays.asList("cancel", "invalid", "void"));
+        ACTION_DICT.put("取消", Arrays.asList("cancel"));
+        ACTION_DICT.put("校验", Arrays.asList("check", "validate", "verify"));
+        ACTION_DICT.put("验证", Arrays.asList("validate", "verify", "check"));
+        ACTION_DICT.put("检查", Arrays.asList("check", "validate"));
+        ACTION_DICT.put("导入", Arrays.asList("import", "upload"));
+        ACTION_DICT.put("导出", Arrays.asList("export", "download"));
+        ACTION_DICT.put("同步", Arrays.asList("sync", "synchronize"));
+        ACTION_DICT.put("计算", Arrays.asList("calculate", "calc", "compute"));
+        ACTION_DICT.put("生成", Arrays.asList("generate", "create", "build"));
+        ACTION_DICT.put("回调", Arrays.asList("callback", "notify"));
+        ACTION_DICT.put("推送", Arrays.asList("push", "send"));
+        ACTION_DICT.put("定时", Arrays.asList("job", "task", "schedule"));
+    }
+
+    // 大模型推断检索词的输出行前缀
+    private static final Pattern ACTION_LINE_PREFIX = Pattern.compile("^\\s*(?:动作|action)", Pattern.CASE_INSENSITIVE);
+
     /**
      * 从用户自然语言提问中提炼核心业务关键词
      *
@@ -158,16 +199,26 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
             String lowerKeyword = keyword.toLowerCase();
             tokens.add(lowerKeyword);
 
+            // 去掉动作词得到业务实体词：例如“实报费用新增” -> “实报费用”，整串在代码中通常不会原样出现
+            String entityKeyword = lowerKeyword;
+            for (String action : ACTION_DICT.keySet()) {
+                entityKeyword = entityKeyword.replace(action, "");
+            }
+            if (entityKeyword.length() >= Constants.TWO && !entityKeyword.equals(lowerKeyword)) {
+                tokens.add(entityKeyword);
+            }
+
             // 词根拆解：例如“调拨单” -> “调拨”；“盘点单” -> “盘点”；“实报费用” -> “实报”
-            if (lowerKeyword.length() >= Constants.THREE) {
-                if (lowerKeyword.endsWith("单") || lowerKeyword.endsWith("表") || lowerKeyword.endsWith("项") || lowerKeyword.endsWith("费")) {
-                    tokens.add(lowerKeyword.substring(Constants.ZERO, lowerKeyword.length() - Constants.ONE));
+            for (String word : Arrays.asList(lowerKeyword, entityKeyword)) {
+                if (word.length() >= Constants.THREE
+                        && (word.endsWith("单") || word.endsWith("表") || word.endsWith("项") || word.endsWith("费"))) {
+                    tokens.add(word.substring(Constants.ZERO, word.length() - Constants.ONE));
                 }
             }
         }
 
         // 提取提问中的英文单词（如用户直接输入了 allocationOrder 等）
-        Matcher enMatcher = Pattern.compile("[a-zA-Z]{3,}").matcher(question);
+        Matcher enMatcher = Pattern.compile("[a-zA-Z]{3,}").matcher(StringUtils.defaultString(question));
         while (enMatcher.find()) {
             tokens.add(enMatcher.group().toLowerCase());
         }
@@ -187,24 +238,60 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
     }
 
     /**
-     * 当初次检索未命中任何文件时，借助大模型极速推断相关的英文类名/表名前缀
+     * 按本地动作词典提取提问中的动作词
      *
      * @param question 用户提问
-     * @return 大模型推断的英文 Token 集合
+     * @return 英文动作 Token 集合
      */
     @Override
-    public Set<String> inferEnglishTokensWithAI(String question) {
-        Set<String> aiTokens = new HashSet<>();
+    public Set<String> resolveActionTokens(String question) {
+        Set<String> actions = new LinkedHashSet<>();
         if (StringUtils.isBlank(question)) {
-            return aiTokens;
+            return actions;
+        }
+        for (Map.Entry<String, List<String>> entry : ACTION_DICT.entrySet()) {
+            if (question.contains(entry.getKey())) {
+                actions.addAll(entry.getValue());
+            }
+        }
+        return actions;
+    }
+
+    /**
+     * 判断业务字典或提问本身是否已提供英文 Token
+     *
+     * @param keyword  核心业务词
+     * @param question 完整提问文本
+     * @return 是否已有英文 Token
+     */
+    @Override
+    public boolean hasEnglishToken(String keyword, String question) {
+        return buildSearchTokens(keyword, question).stream().anyMatch(token -> token.matches("[a-z0-9_]+"));
+    }
+
+    /**
+     * 借助大模型推断提问相关的英文检索词，区分业务实体词与动作词
+     *
+     * @param question 用户提问
+     * @return 推断结果，调用失败时返回空集合
+     */
+    @Override
+    public CodeSearchTermsDTO inferSearchTermsWithAI(String question) {
+        CodeSearchTermsDTO terms = new CodeSearchTermsDTO();
+        if (StringUtils.isBlank(question)) {
+            return terms;
         }
 
         try {
-            log.info("初次代码检索未命中，调用大模型极速推断问题「{}」相关的代码关键词...", question);
+            log.info("调用大模型推断问题「{}」相关的代码检索词...", question);
             List<OpenChatMessageDTO> promptMessages = new ArrayList<>();
             promptMessages.add(OpenChatMessageDTO.builder()
                     .role("system")
-                    .content("你是一名资深 Java 全栈开发专家。请根据用户的中文提问，推断出在 Spring Boot/MyBatis 业务工程中大概率会用到的 2 到 4 个英文类名、表名核心词或缩写（纯小写字母，英文逗号分隔，不要输出任何其他解释文字）。例如输入“调拨单”，输出“allocation,order,transfer”。")
+                    .content("你是一名资深 Java 全栈开发专家。请根据用户的中文提问，推断在 Spring Boot/MyBatis 业务工程中大概率会用到的英文检索词，"
+                            + "严格按两行输出，不要输出任何解释文字：\n"
+                            + "实体: 2 到 5 个业务实体的英文类名、表名核心词或缩写（纯小写字母或下划线，英文逗号分隔）\n"
+                            + "动作: 0 到 4 个方法名中的动作词（如 add, save, check, validate, audit，英文逗号分隔，问题不涉及动作时留空）\n"
+                            + "例如输入“调拨单新增的校验逻辑”，输出：\n实体: allocation,allocation_order,transfer\n动作: add,save,check,validate")
                     .build());
             promptMessages.add(OpenChatMessageDTO.builder()
                     .role("user")
@@ -213,19 +300,37 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
 
             String reply = openCodeService.chat(promptMessages);
             if (StringUtils.isNotBlank(reply)) {
-                String clean = reply.replaceAll("[`'\"\\s]+", "").toLowerCase();
-                String[] parts = clean.split("[,，、]");
-                for (String part : parts) {
-                    if (part.matches("^[a-z_]{2,}$")) {
-                        aiTokens.add(part);
+                for (String line : reply.split("\\r?\\n")) {
+                    // 未带前缀的行按实体词处理，兼容只输出一行逗号分隔词的回复
+                    Set<String> target = ACTION_LINE_PREFIX.matcher(line).find() ? terms.getActionTokens() : terms.getEntityTokens();
+                    String body = line.replaceFirst("^[^:：]*[:：]", "");
+                    String clean = body.replaceAll("[`'\"\\s]+", "").toLowerCase();
+                    for (String part : clean.split("[,，、]")) {
+                        if (part.matches("^[a-z_]{2,}$")) {
+                            target.add(part);
+                        }
                     }
                 }
             }
-            log.info("大模型语义推断英文关键词结果: {}", aiTokens);
+            log.info("大模型推断检索词结果: 实体 {}, 动作 {}", terms.getEntityTokens(), terms.getActionTokens());
         } catch (Exception e) {
-            log.warn("大模型推断英文搜索词异常: {}", e.getMessage());
+            log.warn("大模型推断检索词异常: {}", e.getMessage());
         }
 
+        return terms;
+    }
+
+    /**
+     * 借助大模型推断相关的英文类名/表名前缀（实体词与动作词合并返回）
+     *
+     * @param question 用户提问
+     * @return 大模型推断的英文 Token 集合
+     */
+    @Override
+    public Set<String> inferEnglishTokensWithAI(String question) {
+        CodeSearchTermsDTO terms = inferSearchTermsWithAI(question);
+        Set<String> aiTokens = new HashSet<>(terms.getEntityTokens());
+        aiTokens.addAll(terms.getActionTokens());
         return aiTokens;
     }
 }

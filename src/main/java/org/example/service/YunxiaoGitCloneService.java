@@ -28,10 +28,11 @@ public interface YunxiaoGitCloneService {
      *
      * @param repoDir       本地仓库根目录
      * @param searchKeyword 搜索业务关键词
+     * @param question      用户原始提问（用于补充检索词、动作词与文件类型过滤）
      * @param maxFiles      最大提取相关文件数
      * @return 命中的代码片段列表
      */
-    List<YunxiaoCodeSnippetDTO> scanLocalRepository(File repoDir, String searchKeyword, int maxFiles);
+    List<YunxiaoCodeSnippetDTO> scanLocalRepository(File repoDir, String searchKeyword, String question, int maxFiles);
 
     /**
      * 强制重新克隆指定分支（先删除历史本地克隆，后重新浅克隆并锁定 2 小时缓存）

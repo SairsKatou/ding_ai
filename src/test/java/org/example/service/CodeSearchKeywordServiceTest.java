@@ -1,6 +1,7 @@
 package org.example.service;
 
 import com.ct.common.core.constant.Constants;
+import org.example.domain.dto.CodeSearchTermsDTO;
 import org.example.domain.dto.OpenChatMessageDTO;
 import org.example.service.impl.CodeSearchKeywordServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -125,5 +126,38 @@ public class CodeSearchKeywordServiceTest {
         assertTrue(aiTokens.contains("allocation"));
         assertTrue(aiTokens.contains("order"));
         assertTrue(aiTokens.contains("diaobo_record"));
+    }
+
+    /**
+     * 测试大模型推断检索词时区分实体词与动作词
+     */
+    @Test
+    public void testInferSearchTermsWithAI() {
+        when(openCodeService.chat(anyList())).thenReturn("实体: purchase_return, purchasereturn\n动作：audit,approve");
+
+        CodeSearchTermsDTO terms = codeSearchKeywordService.inferSearchTermsWithAI("采购退货审核逻辑");
+
+        assertEquals(Set.of("purchase_return", "purchasereturn"), terms.getEntityTokens());
+        assertEquals(Set.of("audit", "approve"), terms.getActionTokens());
+    }
+
+    /**
+     * 测试动作词提取，以及去掉动作词后的实体中文词
+     */
+    @Test
+    public void testActionTokensAndEntityKeyword() {
+        Set<String> actions = codeSearchKeywordService.resolveActionTokens("梳理实报费用新增的校验逻辑");
+        assertTrue(actions.contains("add"));
+        assertTrue(actions.contains("check"));
+        assertTrue(actions.contains("validate"));
+
+        String keyword = codeSearchKeywordService.resolveCoreKeyword(null, "梳理实报费用新增的校验逻辑");
+        assertEquals("实报费用新增", keyword);
+        Set<String> tokens = codeSearchKeywordService.buildSearchTokens(keyword, "梳理实报费用新增的校验逻辑");
+        assertTrue(tokens.contains("实报费用"));
+        assertTrue(tokens.contains("reimbursement"));
+
+        assertTrue(codeSearchKeywordService.hasEnglishToken("调拨单", "调拨单审核"));
+        assertFalse(codeSearchKeywordService.hasEnglishToken("售后工单", "售后工单审核逻辑"));
     }
 }
