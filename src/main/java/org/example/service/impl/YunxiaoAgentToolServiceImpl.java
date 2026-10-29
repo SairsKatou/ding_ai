@@ -54,6 +54,14 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
     private static final String TOOL_FIND_TABLE_USAGES = "find_table_usages";
     private static final String TOOL_GET_MAPPER_SQL = "get_mapper_sql";
     private static final String TOOL_READ_METHOD = "read_method";
+    private static final String TOOL_LIST_METHODS = "list_methods";
+    private static final String TOOL_FIND_CALLERS = "find_callers";
+
+    /**
+     * list_methods 最多列出的方法数 / find_callers 最多返回的调用位置数
+     */
+    private static final int MAX_LISTED_METHODS = Constants.HUNDRED;
+    private static final int MAX_CALLERS = Constants.THIRTY;
 
     /**
      * find_table_usages 最多展示的表数量 / 每张表最多展示的引用位置数
@@ -213,6 +221,20 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
                 "按方法名读取完整方法体（含注解与注释，带行号），自动匹配方法起止行，无需猜测行号范围。",
                 readMethodProps, "file_path", "method_name"));
 
+        JSONObject listMethodsProps = new JSONObject();
+        listMethodsProps.put("file_path", buildProperty("string", "Java 文件相对路径，如 src/main/java/com/ct/scm/service/impl/AllocationOrderServiceImpl.java"));
+        tools.add(buildTool(TOOL_LIST_METHODS,
+                "列出 Java 文件中声明的全部方法（方法名、起止行号、声明签名），用于在 read_method 前确定要读的方法名。",
+                listMethodsProps, "file_path"));
+
+        JSONObject findCallersProps = new JSONObject();
+        findCallersProps.put("method_name", buildProperty("string", "被调用的方法名，如 preCheckReimbursement"));
+        findCallersProps.put("class_name", buildProperty("string",
+                "可选：方法所属类的简单类名，如 ScmActualReimbursementServiceImpl；传入后只在引用该类（或其接口）的文件中查找，避免同名方法干扰"));
+        tools.add(buildTool(TOOL_FIND_CALLERS,
+                "查找 Java 源码中调用指定方法的位置（文件:行号、所在方法、调用代码），排除方法声明本身，用于向上追溯调用链。",
+                findCallersProps, "method_name"));
+
         return tools;
     }
 
@@ -260,6 +282,10 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
                     return getMapperSql(args.getString("mapper"), args.getString("method"), root);
                 case TOOL_READ_METHOD:
                     return readMethod(args.getString("file_path"), args.getString("method_name"), root);
+                case TOOL_LIST_METHODS:
+                    return listMethods(args.getString("file_path"), root);
+                case TOOL_FIND_CALLERS:
+                    return findCallers(args.getString("method_name"), args.getString("class_name"), root);
                 default:
                     return "未知工具名称: " + toolName;
             }
@@ -854,6 +880,152 @@ public class YunxiaoAgentToolServiceImpl implements YunxiaoAgentToolService {
             appendNumberedLines(sb, lines, range[0], range[1], MAX_METHOD_LINES);
         }
         return sb.toString();
+    }
+
+    /**
+     * 列出 Java 文件中声明的全部方法
+     *
+     * @param filePath 相对文件路径
+     * @param root     本地仓库根目录
+     * @return 方法名、起止行号与声明签名
+     */
+    private String listMethods(String filePath, Path root) {
+        Path targetFile = resolveRepoFile(filePath, root);
+        String relativePath = getRelativePath(root, targetFile);
+        if (!relativePath.endsWith(".java")) {
+            return "list_methods 仅支持 Java 文件；Mapper XML 请使用 get_mapper_sql 列出语句 id -> " + relativePath;
+        }
+
+        String[] lines;
+        try {
+            lines = readContent(targetFile).split("\\r?\\n", -1);
+        } catch (IOException e) {
+            log.error("读取文件异常: {}", e.getMessage(), e);
+            return "读取文件异常: " + e.getMessage();
+        }
+
+        List<JavaSourceParser.MethodRange> methods = JavaSourceParser.listMethods(lines);
+        if (methods.isEmpty()) {
+            return "「" + relativePath + "」中未识别到方法声明。";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("「").append(relativePath).append("」共 ").append(methods.size()).append(" 个方法（行号区间含注解与注释）:\n");
+        for (JavaSourceParser.MethodRange method : methods.subList(Constants.ZERO, Math.min(methods.size(), MAX_LISTED_METHODS))) {
+            sb.append(String.format("- %s (行 %d-%d): %s\n", method.name(), method.startLine() + Constants.ONE,
+                    method.endLine() + Constants.ONE, abbreviateLine(lines[method.declarationLine()].trim())));
+        }
+        if (methods.size() > MAX_LISTED_METHODS) {
+            sb.append("（仅列出前 ").append(MAX_LISTED_METHODS).append(" 个方法）\n");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 查找调用指定方法的位置（排除方法声明本身）
+     *
+     * @param methodName 方法名
+     * @param className  可选：方法所属类简单类名
+     * @param root       本地仓库根目录
+     * @return 调用位置列表
+     */
+    private String findCallers(String methodName, String className, Path root) {
+        String name = StringUtils.trimToEmpty(StringUtils.substringBefore(methodName, "("));
+        name = name.substring(Math.max(name.lastIndexOf('#'), name.lastIndexOf('.')) + Constants.ONE);
+        if (!name.matches("[A-Za-z_$][\\w$]*")) {
+            return "错误: method_name 不合法 -> " + methodName;
+        }
+        // 传入类名时，只在引用该类或其接口（XxxServiceImpl -> IXxxService / XxxService）的文件中查找
+        List<String> classFilters = new ArrayList<>();
+        String simpleClass = StringUtils.trimToEmpty(className);
+        simpleClass = simpleClass.substring(simpleClass.lastIndexOf('.') + Constants.ONE);
+        if (StringUtils.isNotBlank(simpleClass)) {
+            classFilters.add(simpleClass);
+            if (simpleClass.endsWith("Impl")) {
+                String base = StringUtils.removeEnd(simpleClass, "Impl");
+                classFilters.add(base);
+                classFilters.add("I" + base);
+            }
+        }
+
+        // foo(、.foo(、::foo
+        Pattern callPattern = Pattern.compile("(?<![\\w$])" + Pattern.quote(name) + "\\s*\\(|::\\s*" + Pattern.quote(name) + "(?![\\w$])");
+        List<String> hits = new ArrayList<>();
+        AtomicBoolean truncated = new AtomicBoolean(false);
+        final String targetName = name;
+
+        try {
+            walkCodeFiles(root, (file, attrs) -> {
+                if (!file.getFileName().toString().endsWith(".java") || attrs.size() > MAX_GREP_FILE_SIZE) {
+                    return true;
+                }
+                String content;
+                try {
+                    content = readContent(file);
+                } catch (IOException e) {
+                    return true;
+                }
+                if (!content.contains(targetName)
+                        || (!classFilters.isEmpty() && classFilters.stream().noneMatch(content::contains))) {
+                    return true;
+                }
+                String relativePath = getRelativePath(root, file);
+                String[] lines = content.split("\\r?\\n", -1);
+                List<JavaSourceParser.MethodRange> methods = null;
+                for (int i = Constants.ZERO; i < lines.length; i++) {
+                    String trimmed = lines[i].trim();
+                    if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+                        continue;
+                    }
+                    Matcher matcher = callPattern.matcher(lines[i]);
+                    if (!matcher.find()) {
+                        continue;
+                    }
+                    if (matcher.group().endsWith("(")
+                            && JavaSourceParser.isMethodDeclaration(lines[i].substring(Constants.ZERO, matcher.start()))) {
+                        continue;
+                    }
+                    if (methods == null) {
+                        methods = JavaSourceParser.listMethods(lines);
+                    }
+                    String enclosing = enclosingMethodName(methods, i);
+                    hits.add(relativePath + ":" + (i + Constants.ONE) + (enclosing != null ? " [" + enclosing + "]" : "")
+                            + ": " + abbreviateLine(trimmed));
+                    if (hits.size() >= MAX_CALLERS) {
+                        truncated.set(true);
+                        return false;
+                    }
+                }
+                return true;
+            });
+        } catch (IOException e) {
+            log.error("查找调用方异常: {}", e.getMessage(), e);
+            return "查找调用方异常: " + e.getMessage();
+        }
+
+        if (hits.isEmpty()) {
+            return "未找到调用「" + name + "」的代码" + (classFilters.isEmpty() ? "" : "（已按类 " + simpleClass + " 过滤）") + "。";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("找到 ").append(hits.size()).append(" 处调用「").append(name).append("」的代码（格式：文件:行号 [所在方法]: 代码）:\n");
+        for (String hit : hits) {
+            sb.append(hit).append("\n");
+        }
+        if (truncated.get()) {
+            sb.append("（结果已达上限 ").append(MAX_CALLERS).append(" 条，可传入 class_name 缩小范围）\n");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 查找行所在的方法名
+     */
+    private String enclosingMethodName(List<JavaSourceParser.MethodRange> methods, int line) {
+        for (JavaSourceParser.MethodRange method : methods) {
+            if (method.contains(line)) {
+                return method.name();
+            }
+        }
+        return null;
     }
 
     /**

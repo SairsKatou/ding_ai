@@ -148,6 +148,10 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
         ACTION_DICT.put("定时", Arrays.asList("job", "task", "schedule"));
     }
 
+    // 识别「有几张表 / 涉及哪些表 / 表名」类问题（排除"报表"）
+    private static final Pattern TABLE_QUESTION_PATTERN = Pattern.compile(
+            "(?<!报)表名|几张(?:数据库)?表|多少张表|(?:哪些|什么|几个)(?:数据库)?表|(?:数据库|业务|相关|核心)表|涉及.{0,6}表|用到.{0,6}表");
+
     // 大模型推断检索词的输出行前缀
     private static final Pattern ACTION_LINE_PREFIX = Pattern.compile("^\\s*(?:动作|action)", Pattern.CASE_INSENSITIVE);
 
@@ -267,6 +271,17 @@ public class CodeSearchKeywordServiceImpl implements CodeSearchKeywordService {
     @Override
     public boolean hasEnglishToken(String keyword, String question) {
         return buildSearchTokens(keyword, question).stream().anyMatch(token -> token.matches("[a-z0-9_]+"));
+    }
+
+    /**
+     * 判断是否为表结构类问题
+     *
+     * @param question 用户提问
+     * @return 是否为表结构类问题
+     */
+    @Override
+    public boolean isTableQuestion(String question) {
+        return StringUtils.isNotBlank(question) && TABLE_QUESTION_PATTERN.matcher(question).find();
     }
 
     /**

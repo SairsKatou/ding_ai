@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.example.config.YunxiaoProperties;
+import org.example.domain.dto.CodeAgentSeedDTO;
 import org.example.domain.dto.CodeSearchTermsDTO;
 import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 import org.example.domain.dto.YunxiaoRepoCacheMetadata;
@@ -236,7 +237,88 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
         if (repoDir == null || !repoDir.exists() || !repoDir.isDirectory()) {
             return Collections.emptyList();
         }
+        LocalRanking ranking = rankLocalFiles(repoDir, searchKeyword, question);
+        List<FileMatch> matches = ranking.matches();
 
+        // 5. 提取代码片段：相关度最高的前几个文件给予更大的片段长度
+        List<YunxiaoCodeSnippetDTO> snippets = new ArrayList<>();
+        int limit = Math.min(matches.size(), maxFiles);
+
+        for (int i = Constants.ZERO; i < limit; i++) {
+            File file = matches.get(i).file;
+            String relativePath = matches.get(i).relativePath;
+            try {
+                String content = readContent(file);
+                // 相关度第 1 的文件通常是核心实现类，给 4 倍长度；第 2~3 个给 2 倍
+                int maxChars = i == Constants.ZERO ? MAX_SNIPPET_CHARS * Constants.FOUR
+                        : (i < TOP_SNIPPET_FILES ? MAX_SNIPPET_CHARS * Constants.TWO : MAX_SNIPPET_CHARS);
+                String snippet = extractLocalSnippet(content, relativePath, ranking.tokenWeights(), ranking.actionTokens(), maxChars);
+
+                snippets.add(YunxiaoCodeSnippetDTO.builder()
+                        .filePath(relativePath)
+                        .snippet(snippet)
+                        .matchReason(MATCH_REASON_LOCAL_SCAN)
+                        .build());
+            } catch (Exception e) {
+                log.warn("读取本地文件内容失败, file: {}, error: {}", relativePath, e.getMessage());
+            }
+        }
+
+        return snippets;
+    }
+
+    /**
+     * 为深度扫描 Agent 准备初始线索：英文检索词、相关度最高的文件、首个 Java 文件的方法列表
+     *
+     * @param repoDir       本地仓库根目录
+     * @param searchKeyword 搜索业务关键词
+     * @param question      用户原始提问
+     * @param topFiles      返回的相关文件数
+     * @return 初始线索；仓库目录不存在时返回空对象
+     */
+    @Override
+    public CodeAgentSeedDTO buildAgentSeed(File repoDir, String searchKeyword, String question, int topFiles) {
+        CodeAgentSeedDTO seed = new CodeAgentSeedDTO();
+        if (repoDir == null || !repoDir.isDirectory()) {
+            return seed;
+        }
+        LocalRanking ranking = rankLocalFiles(repoDir, searchKeyword, question);
+        ranking.searchTokens().stream()
+                .filter(token -> token.matches("[a-z0-9_]+"))
+                .sorted(Comparator.comparingDouble((String token) -> -ranking.tokenWeights().getOrDefault(token, 0.0)))
+                .forEach(seed.getEnglishTokens()::add);
+        seed.getActionTokens().addAll(ranking.actionTokens());
+        ranking.matches().stream().limit(topFiles).forEach(m -> seed.getTopFiles().add(m.relativePath));
+
+        // 相关度最高的 Java 文件：列出方法，Agent 可直接 read_method
+        for (FileMatch match : ranking.matches().subList(Constants.ZERO, Math.min(topFiles, ranking.matches().size()))) {
+            if (!match.relativePath.endsWith(".java")) {
+                continue;
+            }
+            try {
+                String[] lines = readContent(match.file).split("\r?\n");
+                seed.setTopFilePath(match.relativePath);
+                for (JavaSourceParser.MethodRange method : JavaSourceParser.listMethods(lines)) {
+                    seed.getTopFileMethods().add(method.name() + " (行 " + (method.startLine() + Constants.ONE)
+                            + "-" + (method.endLine() + Constants.ONE) + ")");
+                }
+            } catch (IOException e) {
+                log.warn("读取深度扫描线索文件失败, file: {}, error: {}", match.relativePath, e.getMessage());
+            }
+            break;
+        }
+        return seed;
+    }
+
+    /**
+     * 本地全量检索并按相关度排序
+     *
+     * @param repoDir       本地仓库根目录
+     * @param searchKeyword 搜索业务关键词
+     * @param question      用户原始提问
+     * @return 排序结果
+     */
+    private LocalRanking rankLocalFiles(File repoDir, String searchKeyword, String question) {
         String fullQuestion = StringUtils.defaultIfBlank(question, searchKeyword);
         Set<String> searchTokens = new HashSet<>(codeSearchKeywordService.buildSearchTokens(searchKeyword, fullQuestion));
         Set<String> actionTokens = new HashSet<>(codeSearchKeywordService.resolveActionTokens(fullQuestion));
@@ -297,31 +379,19 @@ public class YunxiaoGitCloneServiceImpl implements YunxiaoGitCloneService {
                     .collect(Collectors.joining(", ")));
         }
 
-        // 5. 提取代码片段：相关度最高的前几个文件给予更大的片段长度
-        List<YunxiaoCodeSnippetDTO> snippets = new ArrayList<>();
-        int limit = Math.min(matches.size(), maxFiles);
+        return new LocalRanking(matches, tokenWeights, searchTokens, actionTokens);
+    }
 
-        for (int i = Constants.ZERO; i < limit; i++) {
-            File file = matches.get(i).file;
-            String relativePath = matches.get(i).relativePath;
-            try {
-                String content = readContent(file);
-                // 相关度第 1 的文件通常是核心实现类，给 4 倍长度；第 2~3 个给 2 倍
-                int maxChars = i == Constants.ZERO ? MAX_SNIPPET_CHARS * Constants.FOUR
-                        : (i < TOP_SNIPPET_FILES ? MAX_SNIPPET_CHARS * Constants.TWO : MAX_SNIPPET_CHARS);
-                String snippet = extractLocalSnippet(content, relativePath, tokenWeights, actionTokens, maxChars);
-
-                snippets.add(YunxiaoCodeSnippetDTO.builder()
-                        .filePath(relativePath)
-                        .snippet(snippet)
-                        .matchReason(MATCH_REASON_LOCAL_SCAN)
-                        .build());
-            } catch (Exception e) {
-                log.warn("读取本地文件内容失败, file: {}, error: {}", relativePath, e.getMessage());
-            }
-        }
-
-        return snippets;
+    /**
+     * 本地检索排序结果
+     *
+     * @param matches      按相关度降序排列的命中文件
+     * @param tokenWeights Token 权重
+     * @param searchTokens 检索 Token（含大模型补充的实体词）
+     * @param actionTokens 动作词
+     */
+    private record LocalRanking(List<FileMatch> matches, Map<String, Double> tokenWeights,
+                                Set<String> searchTokens, Set<String> actionTokens) {
     }
 
     /**

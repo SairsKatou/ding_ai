@@ -1,5 +1,6 @@
 package org.example.service;
 
+import org.example.domain.dto.CodeAgentSeedDTO;
 import org.example.domain.dto.YunxiaoCodeSnippetDTO;
 
 import java.io.File;
@@ -33,6 +34,17 @@ public interface YunxiaoGitCloneService {
      * @return 命中的代码片段列表
      */
     List<YunxiaoCodeSnippetDTO> scanLocalRepository(File repoDir, String searchKeyword, String question, int maxFiles);
+
+    /**
+     * 为深度扫描 Agent 准备初始线索：英文检索词、相关度最高的文件、首个 Java 文件的方法列表
+     *
+     * @param repoDir       本地仓库根目录
+     * @param searchKeyword 搜索业务关键词
+     * @param question      用户原始提问
+     * @param topFiles      返回的相关文件数
+     * @return 初始线索
+     */
+    CodeAgentSeedDTO buildAgentSeed(File repoDir, String searchKeyword, String question, int topFiles);
 
     /**
      * 强制重新克隆指定分支（先删除历史本地克隆，后重新浅克隆并锁定 2 小时缓存）

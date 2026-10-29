@@ -42,6 +42,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -286,6 +287,69 @@ public class YunxiaoCodeScanServiceTest {
         assertTrue(userPrompt.contains("结构骨架"));
         assertFalse(userPrompt.contains("preCheckReimbursement"));
         assertFalse(userPrompt.contains("checkDatabaseDuplicatesBatch"));
+    }
+
+    /**
+     * 测试深度扫描 Agent 失败：降级为本地普通扫描，并在报告开头注明降级原因
+     */
+    @Test
+    public void testDeepScanAgentFailureDegradesToLocalScan() {
+        YunxiaoRepositoryDTO mockRepo = YunxiaoRepositoryDTO.builder()
+                .id(6120951L)
+                .name("changtai-cloud")
+                .httpUrlToRepo("https://codeup.aliyun.com/mock/changtai-cloud.git")
+                .build();
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.singletonList(mockRepo));
+        when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new File("."));
+        when(yunxiaoCodeAgentService.executeDeepScan(any(), any(File.class), anyString(), anyString()))
+                .thenThrow(new IllegalStateException("Agent 未能成功调用任何代码探查工具"));
+        when(yunxiaoGitCloneService.scanLocalRepository(any(File.class), anyString(), anyString(), anyInt()))
+                .thenReturn(Collections.singletonList(YunxiaoCodeSnippetDTO.builder()
+                        .filePath("service/DemoServiceImpl.java")
+                        .snippet("L1: class DemoServiceImpl {}")
+                        .build()));
+        when(openCodeService.chat(anyList())).thenReturn("普通扫描报告");
+
+        YunxiaoCodeScanParam param = YunxiaoCodeScanParam.builder()
+                .repositoryId("changtai-cloud")
+                .branch("dev")
+                .question("调拨单审核逻辑")
+                .deepScan(Boolean.TRUE)
+                .build();
+        String report = yunxiaoCodeScanService.scanAndAnalyzeBranch(param).getAnalysisReport();
+
+        assertTrue(report.startsWith("⚠️ 深度扫描未完成（Agent 未能成功调用任何代码探查工具），已降级为普通扫描"));
+        assertTrue(report.endsWith("普通扫描报告"));
+    }
+
+    /**
+     * 测试深度扫描本地克隆失败：降级为云效远程扫描，并在报告开头注明克隆失败原因（只取首行）
+     */
+    @Test
+    public void testDeepScanCloneFailureDegradesToRemoteScan() {
+        YunxiaoRepositoryDTO mockRepo = YunxiaoRepositoryDTO.builder()
+                .id(6120951L)
+                .name("changtai-cloud")
+                .httpUrlToRepo("https://codeup.aliyun.com/mock/changtai-cloud.git")
+                .build();
+        when(yunxiaoDevopsService.listRepositories(any())).thenReturn(Collections.singletonList(mockRepo));
+        when(yunxiaoGitCloneService.prepareLocalRepository(anyString(), anyString(), anyString(), anyString()))
+                .thenThrow(new RuntimeException("Git 浅克隆失败: fatal: Remote branch dev not found\nmore git output"));
+        when(yunxiaoRestTemplate.exchange(anyString(), eq(HttpMethod.GET), any(HttpEntity.class), eq(String.class)))
+                .thenReturn(new ResponseEntity<>("[]", HttpStatus.OK));
+
+        YunxiaoCodeScanParam param = YunxiaoCodeScanParam.builder()
+                .repositoryId("changtai-cloud")
+                .branch("dev")
+                .question("调拨单审核逻辑")
+                .deepScan(Boolean.TRUE)
+                .build();
+        String report = yunxiaoCodeScanService.scanAndAnalyzeBranch(param).getAnalysisReport();
+
+        assertTrue(report.startsWith("⚠️ 深度扫描需要本地克隆分支代码，本次克隆失败（Git 浅克隆失败: fatal: Remote branch dev not found）"));
+        assertFalse(report.contains("more git output"));
+        verify(yunxiaoCodeAgentService, never()).executeDeepScan(any(), any(), anyString(), anyString());
     }
 
     /**

@@ -24,6 +24,7 @@ import org.example.service.YunxiaoCodeAgentService;
 import org.example.service.YunxiaoCodeScanService;
 import org.example.service.YunxiaoDevopsService;
 import org.example.service.YunxiaoGitCloneService;
+import org.example.util.CodeCitationVerifier;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -34,25 +35,16 @@ import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.Resource;
 import java.io.File;
-import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -131,26 +123,9 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
     private static final int TABLE_QUESTION_SNIPPET_CHAR_BUDGET = Constants.TWENTY * Constants.THOUSAND;
 
     /**
-     * 识别「有几张表 / 涉及哪些表 / 表名」类问题（排除"报表"）
+     * 降级提示中错误原因的最大长度
      */
-    private static final Pattern TABLE_QUESTION_PATTERN = Pattern.compile(
-            "(?<!报)表名|几张(?:数据库)?表|多少张表|(?:哪些|什么|几个)(?:数据库)?表|(?:数据库|业务|相关|核心)表|涉及.{0,6}表|用到.{0,6}表");
-
-    /**
-     * 报告中的代码引用：文件名.java:行号、文件名.xml:行号、文件名.java:起始行-结束行（兼容全角冒号）
-     */
-    private static final Pattern CODE_CITATION = Pattern.compile(
-            "\\b([A-Za-z][\\w$-]*\\.(?:java|xml))\\s*[:：]\\s*(\\d{1,7})(?:\\s*[-~]\\s*(\\d{1,7}))?");
-
-    /**
-     * 核对引用时跳过的目录
-     */
-    private static final Set<String> CITATION_SKIP_DIRS = Set.of(".git", "target", "node_modules", ".idea", ".mvn", "bin");
-
-    /**
-     * 报告末尾最多列出的核对未通过引用数
-     */
-    private static final int MAX_CITATION_WARNINGS = Constants.TEN;
+    private static final int MAX_DEGRADE_REASON_CHARS = Constants.TWO_HUNDRED;
 
     @Resource
     private RestTemplate yunxiaoRestTemplate;
@@ -227,17 +202,37 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
         // 优先采用【方案 A】：本地 Git 浅克隆缓存策略（保留 2 小时，本地毫秒级全量扫描，默认分析 50 个文件、最大 100 个）
         boolean planASuccess = false;
         File localRepoDir = null;
+        boolean deepScan = Boolean.TRUE.equals(param.getDeepScan());
+        // 深度扫描降级为普通扫描时，在报告开头告知用户原因
+        String degradeNotice = null;
         if (StringUtils.isNotBlank(cloneUrl)) {
             try {
                 log.info("【方案 A 启动】准备仓库 [{}] 分支 [{}] 本地 Git 浅克隆缓存 (保留 2 小时)...", actualRepoName, branch);
                 localRepoDir = yunxiaoGitCloneService.prepareLocalRepository(actualRepoId, actualRepoName, branch, cloneUrl);
-
-                // 若开启多轮 Agent 深度代码探查模式，转交 YunxiaoCodeAgentService 执行 Tool Calling
-                if (Boolean.TRUE.equals(param.getDeepScan())) {
-                    log.info("【多轮 Agent 深度扫描】启用 Tool Calling 闭环探查模式...");
-                    return yunxiaoCodeAgentService.executeDeepScan(param, localRepoDir, actualRepoName, actualRepoId);
+            } catch (Exception e) {
+                log.warn("【方案 A 降级】本地 Git 浅克隆异常 ({})，回退至云效 OpenAPI 远程文件树扫描模式", e.getMessage());
+                if (deepScan) {
+                    degradeNotice = "⚠️ 深度扫描需要本地克隆分支代码，本次克隆失败（" + abbreviateReason(e)
+                            + "），已降级为普通扫描（云效远程检索），结果可能不完整。";
                 }
+            }
+        } else if (deepScan) {
+            degradeNotice = "⚠️ 代码库未返回克隆地址，深度扫描无法执行，已降级为普通扫描（云效远程检索），结果可能不完整。";
+        }
 
+        // 若开启多轮 Agent 深度代码探查模式，转交 YunxiaoCodeAgentService 执行 Tool Calling；失败时降级为本地普通扫描
+        if (localRepoDir != null && deepScan) {
+            try {
+                log.info("【多轮 Agent 深度扫描】启用 Tool Calling 闭环探查模式...");
+                return yunxiaoCodeAgentService.executeDeepScan(param, localRepoDir, actualRepoName, actualRepoId);
+            } catch (Exception e) {
+                log.warn("【深度扫描降级】Agent 探查失败 ({})，回退至本地普通扫描", e.getMessage(), e);
+                degradeNotice = "⚠️ 深度扫描未完成（" + abbreviateReason(e) + "），已降级为普通扫描，结果可能不完整。";
+            }
+        }
+
+        if (localRepoDir != null) {
+            try {
                 matchedSnippets = yunxiaoGitCloneService.scanLocalRepository(localRepoDir, searchKeyword, question, localMaxFiles);
                 if (tableQuestion) {
                     tableSummary = buildTableSummary(localRepoDir, searchKeyword);
@@ -245,7 +240,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 planASuccess = true;
                 log.info("【方案 A 成功】本地全量扫描完成，命中核心代码片段数: {} (最大上限: {})", matchedSnippets.size(), localMaxFiles);
             } catch (Exception e) {
-                log.warn("【方案 A 降级】本地 Git 浅克隆或扫描异常 ({})，回退至云效 OpenAPI 远程文件树扫描模式", e.getMessage());
+                log.warn("【方案 A 降级】本地扫描异常 ({})，回退至云效 OpenAPI 远程文件树扫描模式", e.getMessage());
             }
         }
 
@@ -267,7 +262,7 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                     .question(question)
                     .matchedFileCount(Constants.ZERO)
                     .matchedFiles(Collections.emptyList())
-                    .analysisReport(emptyReport)
+                    .analysisReport(prependNotice(degradeNotice, emptyReport))
                     .build();
         }
 
@@ -277,13 +272,13 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
                 : buildPromptMessages(actualRepoName, actualRepoId, branch, question, searchKeyword, matchedSnippets);
         log.info("准备调用 OpenCode 大模型进行分支代码梳理分析...");
         String analysisReport = openCodeService.chat(messages);
-        if (planASuccess) {
-            analysisReport = appendCitationWarnings(analysisReport, localRepoDir, matchedSnippets);
-        }
-
         List<String> matchedFilePaths = matchedSnippets.stream()
                 .map(YunxiaoCodeSnippetDTO::getFilePath)
                 .collect(Collectors.toList());
+        if (planASuccess) {
+            analysisReport = CodeCitationVerifier.appendWarnings(analysisReport, localRepoDir, matchedFilePaths);
+        }
+        analysisReport = prependNotice(degradeNotice, analysisReport);
 
         return YunxiaoCodeScanResultDTO.builder()
                 .repositoryId(actualRepoId)
@@ -944,119 +939,26 @@ public class YunxiaoCodeScanServiceImpl implements YunxiaoCodeScanService {
      * @return 是否为表结构类问题
      */
     private boolean isTableQuestion(String question) {
-        return StringUtils.isNotBlank(question) && TABLE_QUESTION_PATTERN.matcher(question).find();
+        return codeSearchKeywordService.isTableQuestion(question);
     }
 
     /**
-     * 核对报告中的「文件名.java:行号」引用：文件不存在或行号超出文件总行数时，在报告末尾追加提示
-     *
-     * @param report   大模型分析报告
-     * @param repoDir  本地仓库目录
-     * @param snippets 本次提供给大模型的代码片段（优先在其中查找引用的文件）
-     * @return 追加核对提示后的报告
+     * 在报告开头追加降级提示
      */
-    private String appendCitationWarnings(String report, File repoDir, List<YunxiaoCodeSnippetDTO> snippets) {
-        if (StringUtils.isBlank(report) || repoDir == null || !repoDir.isDirectory()) {
+    private String prependNotice(String notice, String report) {
+        if (StringUtils.isBlank(notice)) {
             return report;
         }
-        Map<String, Integer> citations = new LinkedHashMap<>();
-        Matcher matcher = CODE_CITATION.matcher(report);
-        while (matcher.find()) {
-            int line = Integer.parseInt(matcher.group(Constants.TWO));
-            if (matcher.group(Constants.THREE) != null) {
-                line = Math.max(line, Integer.parseInt(matcher.group(Constants.THREE)));
-            }
-            citations.merge(matcher.group(Constants.ONE), line, Math::max);
-        }
-        if (citations.isEmpty()) {
-            return report;
-        }
-
-        Path root = repoDir.toPath();
-        Map<String, List<Path>> filesByName = new HashMap<>();
-        for (YunxiaoCodeSnippetDTO snippet : snippets) {
-            Path path = root.resolve(snippet.getFilePath()).normalize();
-            filesByName.computeIfAbsent(path.getFileName().toString(), key -> new ArrayList<>()).add(path);
-        }
-        boolean repoIndexed = false;
-
-        List<String> warnings = new ArrayList<>();
-        for (Map.Entry<String, Integer> citation : citations.entrySet()) {
-            String fileName = citation.getKey();
-            int line = citation.getValue();
-            if (!filesByName.containsKey(fileName) && !repoIndexed) {
-                indexRepoFiles(root, filesByName);
-                repoIndexed = true;
-            }
-            List<Path> candidates = filesByName.getOrDefault(fileName, Collections.emptyList());
-            if (candidates.isEmpty()) {
-                warnings.add(fileName + ":" + line + "（分支中不存在该文件）");
-                continue;
-            }
-            int maxLines = candidates.stream().mapToInt(this::countLines).max().orElse(Constants.ZERO);
-            if (line < Constants.ONE || line > maxLines) {
-                warnings.add(fileName + ":" + line + "（行号超出文件总行数 " + maxLines + "）");
-            }
-        }
-        if (warnings.isEmpty()) {
-            return report;
-        }
-
-        log.warn("分析报告中有 {} 处代码引用核对未通过: {}", warnings.size(), warnings);
-        StringBuilder sb = new StringBuilder(report.trim());
-        sb.append("\n\n⚠️ 以下代码引用未能在分支源码中核对通过，请以源码为准：\n");
-        warnings.stream().limit(MAX_CITATION_WARNINGS).forEach(w -> sb.append("- ").append(w).append("\n"));
-        if (warnings.size() > MAX_CITATION_WARNINGS) {
-            sb.append("- ……另有 ").append(warnings.size() - MAX_CITATION_WARNINGS).append(" 处\n");
-        }
-        return sb.toString().trim();
+        return StringUtils.isBlank(report) ? notice : notice + "\n\n" + report;
     }
 
     /**
-     * 按文件名索引仓库内的源码文件（跳过 .git、target、node_modules 等目录）
+     * 截取异常原因（取首行并限制长度，避免 git 输出等长文本刷屏）
      */
-    private void indexRepoFiles(Path root, Map<String, List<Path>> filesByName) {
-        try {
-            Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
-                @Override
-                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                    String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
-                    return !dir.equals(root) && CITATION_SKIP_DIRS.contains(name)
-                            ? FileVisitResult.SKIP_SUBTREE : FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    String name = file.getFileName().toString();
-                    if (name.endsWith(".java") || name.endsWith(".xml")) {
-                        List<Path> paths = filesByName.computeIfAbsent(name, key -> new ArrayList<>());
-                        if (!paths.contains(file.normalize())) {
-                            paths.add(file.normalize());
-                        }
-                    }
-                    return FileVisitResult.CONTINUE;
-                }
-
-                @Override
-                public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                    return FileVisitResult.CONTINUE;
-                }
-            });
-        } catch (IOException e) {
-            log.warn("索引仓库文件异常: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * 统计文件行数，读取失败时返回 0
-     */
-    private int countLines(Path file) {
-        try {
-            String content = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
-            return content.isEmpty() ? Constants.ZERO : content.split("\\r?\\n", -1).length;
-        } catch (IOException e) {
-            return Constants.ZERO;
-        }
+    private String abbreviateReason(Exception e) {
+        String message = StringUtils.defaultIfBlank(e.getMessage(), e.getClass().getSimpleName());
+        String firstLine = message.split("\\r?\\n", Constants.TWO)[Constants.ZERO].trim();
+        return StringUtils.abbreviate(firstLine, MAX_DEGRADE_REASON_CHARS);
     }
 
     /**

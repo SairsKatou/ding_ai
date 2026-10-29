@@ -47,6 +47,14 @@ public interface CodeSearchKeywordService {
     boolean hasEnglishToken(String keyword, String question);
 
     /**
+     * 判断是否为表结构类问题（如「实报费用有几张表」「调拨涉及哪些表」，排除"报表"）
+     *
+     * @param question 用户提问
+     * @return 是否为表结构类问题
+     */
+    boolean isTableQuestion(String question);
+
+    /**
      * 借助大模型推断提问相关的英文检索词，区分业务实体词与动作词
      *
      * @param question 用户提问

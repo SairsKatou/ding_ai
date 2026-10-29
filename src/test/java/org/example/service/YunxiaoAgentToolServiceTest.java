@@ -293,4 +293,73 @@ public class YunxiaoAgentToolServiceTest {
         assertTrue(yunxiaoAgentToolService.executeTool("read_file_range",
                 "{\"file_path\":\"a.java\",\"start_line\":\"abc\"}", tempRepoDir).contains("异常"));
     }
+
+    /**
+     * 测试 list_methods：列出方法名与起止行号；非 Java 文件给出提示
+     */
+    @Test
+    public void testListMethods() throws IOException {
+        writeAllocationService();
+
+        String result = yunxiaoAgentToolService.executeTool("list_methods",
+                "{\"file_path\":\"src/main/java/com/ct/scm/service/AllocationOrderServiceImpl.java\"}", tempRepoDir);
+
+        assertTrue(result.contains("共 3 个方法"));
+        assertTrue(result.contains("- audit (行 2-5)"));
+        assertTrue(result.contains("- checkStatus (行 6-8)"));
+        assertTrue(yunxiaoAgentToolService.executeTool("list_methods",
+                "{\"file_path\":\"src/main/resources/mapper/AllocationOrderMapper.xml\"}", tempRepoDir).contains("get_mapper_sql"));
+    }
+
+    /**
+     * 测试 find_callers：排除方法声明本身，返回调用位置与所在方法；按 class_name 过滤同名方法
+     */
+    @Test
+    public void testFindCallers() throws IOException {
+        writeAllocationService();
+        File controllerDir = new File(tempRepoDir, "src/main/java/com/ct/scm/controller");
+        controllerDir.mkdirs();
+        Files.writeString(new File(controllerDir, "AllocationOrderController.java").toPath(),
+                "public class AllocationOrderController {\n"
+                        + "    private IAllocationOrderService allocationOrderService;\n"
+                        + "    public void audit(Long id) {\n"
+                        + "        allocationOrderService.audit(id);\n"
+                        + "    }\n"
+                        + "}\n", StandardCharsets.UTF_8);
+        // 同名方法、但与调拨单无关的类
+        Files.writeString(new File(controllerDir, "PurchaseController.java").toPath(),
+                "public class PurchaseController {\n"
+                        + "    public void run() { purchaseService.audit(1L); }\n"
+                        + "}\n", StandardCharsets.UTF_8);
+
+        String checkCallers = yunxiaoAgentToolService.executeTool("find_callers", "{\"method_name\":\"checkStatus\"}", tempRepoDir);
+        assertTrue(checkCallers.contains("AllocationOrderServiceImpl.java:3 [audit]"));
+        assertFalse(checkCallers.contains(":6"));
+
+        String auditCallers = yunxiaoAgentToolService.executeTool("find_callers",
+                "{\"method_name\":\"audit\",\"class_name\":\"AllocationOrderServiceImpl\"}", tempRepoDir);
+        assertTrue(auditCallers.contains("AllocationOrderController.java:4 [audit]"));
+        assertFalse(auditCallers.contains("PurchaseController"));
+        // 方法声明行不算调用
+        assertFalse(auditCallers.contains("AllocationOrderController.java:3"));
+    }
+
+    private void writeAllocationService() throws IOException {
+        File serviceDir = new File(tempRepoDir, "src/main/java/com/ct/scm/service");
+        serviceDir.mkdirs();
+        Files.writeString(new File(serviceDir, "AllocationOrderServiceImpl.java").toPath(),
+                "public class AllocationOrderServiceImpl implements IAllocationOrderService {\n"
+                        + "    public void audit(Long id) {\n"
+                        + "        checkStatus(id);\n"
+                        + "        log.info(\"audit\");\n"
+                        + "    }\n"
+                        + "    private void checkStatus(Long id) {\n"
+                        + "        // checkStatus 不在此处调用\n"
+                        + "    }\n"
+                        + "    public List<Long> list() { return null; }\n"
+                        + "}\n", StandardCharsets.UTF_8);
+        File mapperDir = new File(tempRepoDir, "src/main/resources/mapper");
+        mapperDir.mkdirs();
+        Files.writeString(new File(mapperDir, "AllocationOrderMapper.xml").toPath(), "<mapper/>\n", StandardCharsets.UTF_8);
+    }
 }
