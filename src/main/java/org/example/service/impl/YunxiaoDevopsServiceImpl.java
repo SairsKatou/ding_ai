@@ -434,7 +434,7 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 	}
 
 	/**
-	 * 查询云效流水线列表
+	 * 查询云效流水线列表（当未指定分页参数时自动循环全量拉取组织下的所有流水线）
 	 *
 	 * @param queryParam 查询参数
 	 * @return 流水线列表
@@ -444,32 +444,27 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 		// 校验令牌是否配置
 		checkAccessToken();
 
-		// 构建流水线查询 URL
-		String url = buildPipelinesUrl(queryParam);
-		// 创建身份认证实体
-		HttpEntity<?> entity = createAuthEntity();
+		String keyword = (queryParam != null && StringUtils.isNotBlank(queryParam.getPipelineName()))
+				? queryParam.getPipelineName().trim()
+				: null;
+		Long groupId = (queryParam != null) ? queryParam.getPipelineGroupId() : null;
 
-		try {
-			log.info("开始请求云效查询流水线列表, url: {}", url);
-			ResponseEntity<String> response = yunxiaoRestTemplate.exchange(url, HttpMethod.GET, entity, String.class);
-			String body = response.getBody();
+		// 1. 如果调用方显式指定了分页参数，执行单页查询
+		if (queryParam != null && queryParam.getPageNum() != null && queryParam.getPageSize() != null) {
+			long page = queryParam.getPageNum().longValue();
+			long pageSize = queryParam.getPageSize().longValue();
+			List<YunxiaoPipelineDTO> singlePage = fetchSinglePagePipelines(page, pageSize, keyword, groupId);
 
-			if (StringUtils.isBlank(body)) {
-				log.warn("云效流水线查询返回为空响应");
-				return Collections.emptyList();
+			// 若显式传入搜索词但服务端未查到（云效前缀限制），尝试拉取全量并在本地进行子串模糊匹配后切片
+			if (CollectionUtils.isEmpty(singlePage) && StringUtils.isNotBlank(keyword)) {
+				List<YunxiaoPipelineDTO> allMatched = fetchAllPipelinesWithFilter(keyword, groupId);
+				return paginateList(allMatched, queryParam.getPageNum(), queryParam.getPageSize());
 			}
-
-			// 解析响应为流水线列表
-			return parseToPipelineList(body);
-		} catch (HttpStatusCodeException e) {
-			String responseBody = e.getResponseBodyAsString();
-			log.error("云效流水线查询 HTTP 异常, 状态码: {}, 响应体: {}", e.getStatusCode(), responseBody, e);
-			// 提取错误提示并抛出业务异常
-			throw new RuntimeException("云效流水线查询失败: " + extractErrorMessage(responseBody, e.getMessage()), e);
-		} catch (Exception e) {
-			log.error("云效流水线查询发生未预期异常: {}", e.getMessage(), e);
-			throw new RuntimeException("云效流水线查询异常: " + e.getMessage(), e);
+			return singlePage;
 		}
+
+		// 2. 未指定分页参数时，自动循环全量抓取所有页数据合并返回
+		return fetchAllPipelinesWithFilter(keyword, groupId);
 	}
 
 	/**
@@ -513,11 +508,12 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 			return list;
 		} catch (HttpStatusCodeException e) {
 			String responseBody = e.getResponseBodyAsString();
-			log.error("云效流水线分组查询 HTTP 异常, 状态码: {}, 响应体: {}", e.getStatusCode(), responseBody, e);
-			throw new RuntimeException("云效流水线分组查询失败: " + extractErrorMessage(responseBody, e.getMessage()), e);
+			log.warn("云效流水线分组接口无权限或异常 (HTTP {}), 响应: {}, 自动启用环境分组规则平滑降级", e.getStatusCode(), responseBody);
+			// 令牌缺少 pipelineGroups 接口权限时，平滑降级为基于环境的标准分组
+			return buildDefaultEnvironmentGroups(queryParam);
 		} catch (Exception e) {
-			log.error("云效流水线分组查询发生未预期异常: {}", e.getMessage(), e);
-			throw new RuntimeException("云效流水线分组查询异常: " + e.getMessage(), e);
+			log.warn("云效流水线分组查询发生异常: {}, 自动启用环境分组规则平滑降级", e.getMessage());
+			return buildDefaultEnvironmentGroups(queryParam);
 		}
 	}
 
@@ -622,9 +618,11 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 					continue;
 				}
 
-				// 匹配方式二：流水线名称包含该分组名称（例如 ct-modules-scm-测试环境 归类至 测试环境 分组）
+				// 匹配方式二：流水线名称包含该分组名称或环境别名兼容（例如 预发环境 匹配 预发布环境 分组）
 				if (StringUtils.isNotBlank(groupName) && StringUtils.isNotBlank(pipeline.getPipelineName())) {
 					if (pipeline.getPipelineName().contains(groupName)) {
+						matchedList.add(pipeline);
+					} else if (groupName.contains("预发") && pipeline.getPipelineName().contains("预发")) {
 						matchedList.add(pipeline);
 					}
 				}
@@ -669,7 +667,7 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 		String url = buildPipelineRunUrl(resolvedPipelineId);
 
 		// 构建请求体参数
-		JSONObject requestBody = buildPipelineRunBody(branchName, repositoryId, effectiveEnv, runParam.getComment(), runParam.getEnvs());
+		JSONObject requestBody = buildPipelineRunBody(branchName, repositoryId, effectiveEnv, runParam.getComment(), null);
 		// 创建携带令牌及 JSON 体的请求实体
 		HttpEntity<?> entity = createAuthJsonEntity(requestBody);
 
@@ -685,6 +683,9 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 			runDTO.setEnv(effectiveEnv);
 			runDTO.setPipelineGroupId(runParam.getPipelineGroupId());
 			runDTO.setPipelineGroupName(runParam.getPipelineGroupName());
+			if (StringUtils.isBlank(runDTO.getPipelineName()) && StringUtils.isNotBlank(runParam.getPipelineName())) {
+				runDTO.setPipelineName(runParam.getPipelineName());
+			}
 			return runDTO;
 		} catch (HttpStatusCodeException e) {
 			String responseBody = e.getResponseBodyAsString();
@@ -729,71 +730,110 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 		Long pipelineGroupId = null;
 		String pipelineGroupName = null;
 
-		List<String> remainingTokens = new ArrayList<>();
-		for (String token : parts) {
-			if (StringUtils.isBlank(token)) {
-				continue;
-			}
-			String trimmedToken = token.trim();
-			// 支持键值对形式（如 仓库=xx 分支=yy 环境=zz 流水线=123 分组=yy）
-			if (trimmedToken.contains("=")) {
-				int eqIndex = trimmedToken.indexOf('=');
-				String key = trimmedToken.substring(Constants.ZERO, eqIndex).trim();
-				String value = trimmedToken.substring(eqIndex + Constants.ONE).trim();
-				if ("仓库".equals(key) || "项目".equals(key) || "repo".equalsIgnoreCase(key)) {
-					repoIdOrName = value;
-				} else if ("分支".equals(key) || "发布分支".equals(key) || "branch".equalsIgnoreCase(key)) {
-					branchName = value;
-				} else if ("环境".equals(key) || "env".equalsIgnoreCase(key)) {
-					env = value;
-				} else if ("流水线".equals(key) || "流水线ID".equals(key) || "pipelineId".equalsIgnoreCase(key)) {
-					if (StringUtils.isNumeric(value)) {
-						pipelineId = Long.valueOf(value);
-					}
-				} else if ("分组".equals(key) || "流水线分组".equals(key) || "组".equals(key) || "group".equalsIgnoreCase(key) || "groupId".equalsIgnoreCase(key)) {
-					if (StringUtils.isNumeric(value)) {
-						pipelineGroupId = Long.valueOf(value);
-					} else {
-						pipelineGroupName = value;
-					}
-				}
-			} else if (isRecognizedEnvKeyword(trimmedToken) && env == null) {
-				// 显式环境关键词 (如 开发/测试/生产/dev/test/prod/pre)
-				env = trimmedToken;
-			} else if (StringUtils.isNumeric(trimmedToken) && pipelineId == null) {
-				// 纯数字优先作为流水线ID
-				pipelineId = Long.valueOf(trimmedToken);
-			} else {
-				remainingTokens.add(trimmedToken);
+		// 检查是否包含等号（键值对格式）
+		boolean hasKeyValue = false;
+		for (String part : parts) {
+			if (part.contains("=")) {
+				hasKeyValue = true;
+				break;
 			}
 		}
 
-		// 填充未通过 key=value 指定的分支与仓库名/分组名
-		if (branchName == null) {
-			if (remainingTokens.size() == Constants.ONE) {
-				// 仅有1个剩余参数：作为分支名
-				branchName = remainingTokens.get(Constants.ZERO);
-			} else if (remainingTokens.size() >= Constants.TWO) {
-				String firstToken = remainingTokens.get(Constants.ZERO);
-				String secondToken = remainingTokens.get(Constants.ONE);
-				// 优先检查 firstToken 是否匹配流水线分组名称
-				Long matchedGroupId = resolvePipelineGroupIdByName(firstToken);
+		if (hasKeyValue) {
+			// 键值对解析模式（如 仓库=xx 分支=yy 环境=zz 流水线=123 分组=yy）
+			List<String> plainTokens = new ArrayList<>();
+			for (String token : parts) {
+				if (StringUtils.isBlank(token)) {
+					continue;
+				}
+				String trimmedToken = token.trim();
+				if (trimmedToken.contains("=")) {
+					int eqIndex = trimmedToken.indexOf('=');
+					String key = trimmedToken.substring(Constants.ZERO, eqIndex).trim();
+					String value = trimmedToken.substring(eqIndex + Constants.ONE).trim();
+					if ("仓库".equals(key) || "项目".equals(key) || "模块".equals(key) || "repo".equalsIgnoreCase(key)) {
+						repoIdOrName = value;
+					} else if ("分支".equals(key) || "发布分支".equals(key) || "branch".equalsIgnoreCase(key)) {
+						branchName = value;
+					} else if ("环境".equals(key) || "env".equalsIgnoreCase(key)) {
+						env = value;
+					} else if ("流水线".equals(key) || "流水线ID".equals(key) || "pipelineId".equalsIgnoreCase(key)) {
+						if (StringUtils.isNumeric(value)) {
+							pipelineId = Long.valueOf(value);
+						}
+					} else if ("分组".equals(key) || "流水线分组".equals(key) || "组".equals(key) || "group".equalsIgnoreCase(key) || "groupId".equalsIgnoreCase(key)) {
+						if (StringUtils.isNumeric(value)) {
+							pipelineGroupId = Long.valueOf(value);
+						} else {
+							pipelineGroupName = value;
+						}
+					}
+				} else {
+					plainTokens.add(trimmedToken);
+				}
+			}
+			if (branchName == null && !plainTokens.isEmpty()) {
+				branchName = plainTokens.get(Constants.ZERO);
+			}
+		} else {
+			// 纯位置参数模式（如：file dev 开发、ct-modules-scm feature/v1、feature/v1 等）
+			List<String> tokens = new ArrayList<>();
+			for (String p : parts) {
+				if (StringUtils.isNotBlank(p)) {
+					tokens.add(p.trim());
+				}
+			}
+
+			if (tokens.size() == Constants.ONE) {
+				// 1 个参数：作为分支名
+				branchName = tokens.get(Constants.ZERO);
+			} else if (tokens.size() == Constants.TWO) {
+				String t0 = tokens.get(Constants.ZERO);
+				String t1 = tokens.get(Constants.ONE);
+				// 如果第2个词是显式环境词（如 开发/测试/生产），则第1个词为分支名
+				if (isRecognizedEnvKeyword(t1)) {
+					branchName = t0;
+					env = t1;
+				} else {
+					// 否则第1个为模块/仓库名，第2个为分支名
+					repoIdOrName = t0;
+					branchName = t1;
+				}
+			} else if (tokens.size() == Constants.THREE) {
+				// 3 个参数标准模式：<模块名> <分支名> <环境>，如 file dev 开发
+				repoIdOrName = tokens.get(Constants.ZERO);
+				branchName = tokens.get(Constants.ONE);
+				env = tokens.get(Constants.TWO);
+			} else if (tokens.size() >= Constants.FOUR) {
+				repoIdOrName = tokens.get(Constants.ZERO);
+				branchName = tokens.get(Constants.ONE);
+				String t2 = tokens.get(Constants.TWO);
+				String t3 = tokens.get(Constants.THREE);
+				// 智能识别第 3 与第 4 参数中的数字流水线 ID 与环境名
+				if (StringUtils.isNumeric(t2)) {
+					pipelineId = Long.valueOf(t2);
+					env = t3;
+				} else if (StringUtils.isNumeric(t3)) {
+					pipelineId = Long.valueOf(t3);
+					env = t2;
+				} else {
+					env = t2;
+				}
+			}
+
+			// 检查 repoIdOrName 是否匹配流水线分组名称
+			if (StringUtils.isNotBlank(repoIdOrName)) {
+				Long matchedGroupId = resolvePipelineGroupIdByName(repoIdOrName);
 				if (matchedGroupId != null) {
 					pipelineGroupId = matchedGroupId;
-					pipelineGroupName = firstToken;
-				} else {
-					repoIdOrName = firstToken;
-				}
-				branchName = secondToken;
-				if (env == null && remainingTokens.size() >= Constants.THREE) {
-					env = remainingTokens.get(Constants.TWO);
+					pipelineGroupName = repoIdOrName;
 				}
 			}
 		}
 
 		if (StringUtils.isBlank(branchName)) {
 			return "⚠️ 请提供待发布的分支名称！\n"
-					+ "👉 格式：发布分支 [分组/仓库名] <待发布分支名> [环境]";
+					+ "👉 格式：发布分支 [分组/模块名] <待发布分支名> [环境]";
 		}
 
 		// 解析最终生效的环境
@@ -881,6 +921,9 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 			if (tempParam.getPipelineGroupId() != null && cancelParam.getPipelineGroupId() == null) {
 				cancelParam.setPipelineGroupId(tempParam.getPipelineGroupId());
 			}
+			if (StringUtils.isNotBlank(tempParam.getPipelineName()) && StringUtils.isBlank(cancelParam.getPipelineName())) {
+				cancelParam.setPipelineName(tempParam.getPipelineName());
+			}
 		}
 
 		if (resolvedPipelineId == null || resolvedPipelineId <= Constants.ZERO_LONG) {
@@ -914,6 +957,7 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 
 			return YunxiaoPipelineCancelDTO.builder()
 					.pipelineId(resolvedPipelineId)
+					.pipelineName(cancelParam.getPipelineName())
 					.pipelineRunId(resolvedRunId)
 					.pipelineGroupId(cancelParam.getPipelineGroupId())
 					.pipelineGroupName(cancelParam.getPipelineGroupName())
@@ -965,66 +1009,111 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 		Long pipelineGroupId = null;
 		String pipelineGroupName = null;
 
-		List<String> remainingTokens = new ArrayList<>();
-		for (String token : parts) {
-			if (StringUtils.isBlank(token)) {
-				continue;
-			}
-			String trimmedToken = token.trim();
-			// 支持键值对形式（如 仓库=xx 分支=yy 环境=zz 批次ID=123 分组=yy）
-			if (trimmedToken.contains("=")) {
-				int eqIndex = trimmedToken.indexOf('=');
-				String key = trimmedToken.substring(Constants.ZERO, eqIndex).trim();
-				String value = trimmedToken.substring(eqIndex + Constants.ONE).trim();
-				if ("仓库".equals(key) || "项目".equals(key) || "repo".equalsIgnoreCase(key)) {
-					repoIdOrName = value;
-				} else if ("分支".equals(key) || "branch".equalsIgnoreCase(key)) {
-					branchName = value;
-				} else if ("环境".equals(key) || "env".equalsIgnoreCase(key)) {
-					env = value;
-				} else if ("批次".equals(key) || "批次ID".equals(key) || "runId".equalsIgnoreCase(key) || "pipelineRunId".equalsIgnoreCase(key)) {
-					if (StringUtils.isNumeric(value)) {
-						pipelineRunId = Long.valueOf(value);
-					}
-				} else if ("分组".equals(key) || "流水线分组".equals(key) || "组".equals(key) || "group".equalsIgnoreCase(key) || "groupId".equalsIgnoreCase(key)) {
-					if (StringUtils.isNumeric(value)) {
-						pipelineGroupId = Long.valueOf(value);
-					} else {
-						pipelineGroupName = value;
-					}
-				}
-			} else if (isRecognizedEnvKeyword(trimmedToken) && env == null) {
-				// 显式环境关键词 (如 开发/测试/生产/dev/test/prod/pre)
-				env = trimmedToken;
-			} else if (StringUtils.isNumeric(trimmedToken) && pipelineRunId == null) {
-				pipelineRunId = Long.valueOf(trimmedToken);
-			} else {
-				remainingTokens.add(trimmedToken);
+		// 检查是否包含等号（键值对格式）
+		boolean hasKeyValue = false;
+		for (String part : parts) {
+			if (part.contains("=")) {
+				hasKeyValue = true;
+				break;
 			}
 		}
 
-		// 填充未通过 key=value 指定的分支与仓库名/分组名
-		if (branchName == null && pipelineRunId == null) {
-			if (remainingTokens.size() == Constants.ONE) {
-				branchName = remainingTokens.get(Constants.ZERO);
-			} else if (remainingTokens.size() >= Constants.TWO) {
-				String firstToken = remainingTokens.get(Constants.ZERO);
-				String secondToken = remainingTokens.get(Constants.ONE);
-				// 优先检查 firstToken 是否匹配流水线分组名称
-				Long matchedGroupId = resolvePipelineGroupIdByName(firstToken);
-				if (matchedGroupId != null) {
-					pipelineGroupId = matchedGroupId;
-					pipelineGroupName = firstToken;
-				} else {
-					repoIdOrName = firstToken;
+		if (hasKeyValue) {
+			// 键值对解析模式（如 仓库=xx 分支=yy 环境=zz 批次ID=123 分组=yy）
+			List<String> plainTokens = new ArrayList<>();
+			for (String token : parts) {
+				if (StringUtils.isBlank(token)) {
+					continue;
 				}
-				branchName = secondToken;
-				if (env == null && remainingTokens.size() >= Constants.THREE) {
-					env = remainingTokens.get(Constants.TWO);
+				String trimmedToken = token.trim();
+				if (trimmedToken.contains("=")) {
+					int eqIndex = trimmedToken.indexOf('=');
+					String key = trimmedToken.substring(Constants.ZERO, eqIndex).trim();
+					String value = trimmedToken.substring(eqIndex + Constants.ONE).trim();
+					if ("仓库".equals(key) || "项目".equals(key) || "模块".equals(key) || "repo".equalsIgnoreCase(key)) {
+						repoIdOrName = value;
+					} else if ("分支".equals(key) || "branch".equalsIgnoreCase(key)) {
+						branchName = value;
+					} else if ("环境".equals(key) || "env".equalsIgnoreCase(key)) {
+						env = value;
+					} else if ("批次".equals(key) || "批次ID".equals(key) || "runId".equalsIgnoreCase(key) || "pipelineRunId".equalsIgnoreCase(key)) {
+						if (StringUtils.isNumeric(value)) {
+							pipelineRunId = Long.valueOf(value);
+						}
+					} else if ("分组".equals(key) || "流水线分组".equals(key) || "组".equals(key) || "group".equalsIgnoreCase(key) || "groupId".equalsIgnoreCase(key)) {
+						if (StringUtils.isNumeric(value)) {
+							pipelineGroupId = Long.valueOf(value);
+						} else {
+							pipelineGroupName = value;
+						}
+					}
+				} else {
+					plainTokens.add(trimmedToken);
 				}
 			}
-		} else if (branchName == null && !remainingTokens.isEmpty()) {
-			branchName = remainingTokens.get(Constants.ZERO);
+			if (branchName == null && pipelineRunId == null && !plainTokens.isEmpty()) {
+				branchName = plainTokens.get(Constants.ZERO);
+			}
+		} else {
+			// 纯位置参数模式（如：file dev 开发、ct-modules-scm feature/v1、987654321 等）
+			List<String> tokens = new ArrayList<>();
+			for (String p : parts) {
+				if (StringUtils.isNotBlank(p)) {
+					tokens.add(p.trim());
+				}
+			}
+
+			if (tokens.size() == Constants.ONE) {
+				String t0 = tokens.get(Constants.ZERO);
+				if (StringUtils.isNumeric(t0)) {
+					pipelineRunId = Long.valueOf(t0);
+				} else {
+					branchName = t0;
+				}
+			} else if (tokens.size() == Constants.TWO) {
+				String t0 = tokens.get(Constants.ZERO);
+				String t1 = tokens.get(Constants.ONE);
+				if (isRecognizedEnvKeyword(t1)) {
+					if (StringUtils.isNumeric(t0)) {
+						pipelineRunId = Long.valueOf(t0);
+					} else {
+						branchName = t0;
+					}
+					env = t1;
+				} else {
+					repoIdOrName = t0;
+					branchName = t1;
+				}
+			} else if (tokens.size() == Constants.THREE) {
+				// 3 个参数标准模式：<模块名> <分支名> <环境>，如 file dev 开发
+				repoIdOrName = tokens.get(Constants.ZERO);
+				branchName = tokens.get(Constants.ONE);
+				env = tokens.get(Constants.TWO);
+			} else if (tokens.size() >= Constants.FOUR) {
+				repoIdOrName = tokens.get(Constants.ZERO);
+				branchName = tokens.get(Constants.ONE);
+				String t2 = tokens.get(Constants.TWO);
+				String t3 = tokens.get(Constants.THREE);
+				// 智能识别第 3 与第 4 参数中的数字批次 ID 与环境名
+				if (StringUtils.isNumeric(t2)) {
+					pipelineRunId = Long.valueOf(t2);
+					env = t3;
+				} else if (StringUtils.isNumeric(t3)) {
+					pipelineRunId = Long.valueOf(t3);
+					env = t2;
+				} else {
+					env = t2;
+				}
+			}
+
+			// 检查 repoIdOrName 是否匹配流水线分组名称
+			if (StringUtils.isNotBlank(repoIdOrName)) {
+				Long matchedGroupId = resolvePipelineGroupIdByName(repoIdOrName);
+				if (matchedGroupId != null) {
+					pipelineGroupId = matchedGroupId;
+					pipelineGroupName = repoIdOrName;
+				}
+			}
 		}
 
 		// 解析生效的环境
@@ -1058,6 +1147,9 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 			sb.append("🌍 所属环境：").append(effectiveEnv).append(getEnvChineseLabel(effectiveEnv)).append("\n");
 			if (cancelDTO.getPipelineId() != null) {
 				sb.append("⚙️ 流水线ID：").append(cancelDTO.getPipelineId()).append("\n");
+			}
+			if (StringUtils.isNotBlank(cancelDTO.getPipelineName())) {
+				sb.append("📋 流水线名称：").append(cancelDTO.getPipelineName()).append("\n");
 			}
 			if (cancelDTO.getPipelineRunId() != null) {
 				sb.append("🆔 终止批次ID：").append(cancelDTO.getPipelineRunId()).append("\n");
@@ -1274,7 +1366,7 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 					String pName = pipeline.getPipelineName();
 					if (StringUtils.containsIgnoreCase(pName, repoTarget) && isPipelineMatchEnv(pName, envTarget)) {
 						log.info("分组 [{}] 内按仓库与环境精确匹配到流水线 [{}] ID: {}, 环境: {}", targetGroupId, pName, pipeline.getPipelineId(), envTarget);
-						return pipeline.getPipelineId();
+						return recordPipelineAndReturnId(runParam, pipeline);
 					}
 				}
 
@@ -1282,7 +1374,7 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 				for (YunxiaoPipelineDTO pipeline : filtered) {
 					if (isPipelineMatchEnv(pipeline.getPipelineName(), envTarget)) {
 						log.info("分组 [{}] 内按环境匹配到流水线 [{}] ID: {}, 环境: {}", targetGroupId, pipeline.getPipelineName(), pipeline.getPipelineId(), envTarget);
-						return pipeline.getPipelineId();
+						return recordPipelineAndReturnId(runParam, pipeline);
 					}
 				}
 
@@ -1290,14 +1382,14 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 				for (YunxiaoPipelineDTO pipeline : filtered) {
 					if (StringUtils.containsIgnoreCase(pipeline.getPipelineName(), repoTarget)) {
 						log.info("分组 [{}] 内按仓库匹配到流水线 [{}] ID: {}", targetGroupId, pipeline.getPipelineName(), pipeline.getPipelineId());
-						return pipeline.getPipelineId();
+						return recordPipelineAndReturnId(runParam, pipeline);
 					}
 				}
 
 				// 3.4 若仅有1个或未细分环境，使用分组下首个流水线
 				YunxiaoPipelineDTO first = filtered.get(Constants.ZERO);
 				log.info("分组 [{}] 内选用首个流水线 [{}] ID: {}", targetGroupId, first.getPipelineName(), first.getPipelineId());
-				return first.getPipelineId();
+				return recordPipelineAndReturnId(runParam, first);
 			}
 		}
 
@@ -1311,34 +1403,180 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 			queryParam.setPageNum(Constants.ONE);
 			queryParam.setPageSize(Constants.TEN);
 
-			// 查询云效流水线列表
+			// 优先尝试云效服务端按名称检索
 			List<YunxiaoPipelineDTO> pipelines = listPipelines(queryParam);
+
+			// 如果服务端检索未返回（例如用户输入的是简写 file、scm，而云效名称为 ct-modules-file-开发环境），
+			// 自动拉取流水线列表在本地进行全量子串智能模糊匹配，支持用户输入任意简写
+			if (CollectionUtils.isEmpty(pipelines)) {
+				log.info("按 pipelineName={} 服务端未查到流水线，自动拉取流水线列表进行本地智能模糊匹配", searchTarget);
+				YunxiaoPipelineQueryParam allParam = new YunxiaoPipelineQueryParam();
+				allParam.setPageNum(Constants.ONE);
+				allParam.setPageSize(Constants.HUNDRED);
+				pipelines = listPipelines(allParam);
+			}
+
 			if (CollectionUtils.isNotEmpty(pipelines)) {
-				// 优先同时包含仓库与环境名称的流水线 (如 changtai-cloud-test 或 ct-modules-scm-测试环境)
+				// 1. 优先：同时包含模块简写关键词且匹配目标环境 (如包含 file 且包含 开发环境)
 				for (YunxiaoPipelineDTO pipeline : pipelines) {
 					String pName = pipeline.getPipelineName();
 					if (StringUtils.containsIgnoreCase(pName, searchTarget) && isPipelineMatchEnv(pName, envTarget)) {
-						log.info("按仓库与环境精确匹配到发布流水线 [{}] ID: {}, 环境: {}", pName, pipeline.getPipelineId(), envTarget);
-						return pipeline.getPipelineId();
+						log.info("按仓库/简写与环境精确匹配到发布流水线 [{}] ID: {}, 环境: {}", pName, pipeline.getPipelineId(), envTarget);
+						return recordPipelineAndReturnId(runParam, pipeline);
 					}
 				}
 
-				// 其次优先完全匹配名称
+				// 2. 其次：优先完全匹配名称
 				for (YunxiaoPipelineDTO pipeline : pipelines) {
 					if (StringUtils.equalsIgnoreCase(pipeline.getPipelineName(), searchTarget)) {
 						log.info("精确匹配到发布流水线 [{}] ID: {}", pipeline.getPipelineName(), pipeline.getPipelineId());
-						return pipeline.getPipelineId();
+						return recordPipelineAndReturnId(runParam, pipeline);
 					}
 				}
 
-				// 再次取首个模糊匹配结果
+				// 3. 再次：仅包含模块简写名称（如包含 file）
+				for (YunxiaoPipelineDTO pipeline : pipelines) {
+					if (StringUtils.containsIgnoreCase(pipeline.getPipelineName(), searchTarget)) {
+						log.info("按模块/简写匹配到发布流水线 [{}] ID: {}", pipeline.getPipelineName(), pipeline.getPipelineId());
+						return recordPipelineAndReturnId(runParam, pipeline);
+					}
+				}
+
+				// 4. 若用户未指定特定模块（使用默认仓库名）且有匹配环境的流水线
+				for (YunxiaoPipelineDTO pipeline : pipelines) {
+					if (isPipelineMatchEnv(pipeline.getPipelineName(), envTarget)) {
+						log.info("按环境匹配到发布流水线 [{}] ID: {}, 环境: {}", pipeline.getPipelineName(), pipeline.getPipelineId(), envTarget);
+						return recordPipelineAndReturnId(runParam, pipeline);
+					}
+				}
+
+				// 5. 兜底取首个流水线结果
 				YunxiaoPipelineDTO first = pipelines.get(Constants.ZERO);
 				log.info("未精确匹配，使用首个流水线搜索结果 [{}] ID: {}", first.getPipelineName(), first.getPipelineId());
-				return first.getPipelineId();
+				return recordPipelineAndReturnId(runParam, first);
 			}
 		}
 
 		return null;
+	}
+
+	/**
+	 * 从云效查询单页流水线列表
+	 *
+	 * @param page            页码
+	 * @param perPage         每页数量
+	 * @param pipelineName    流水线名称
+	 * @param pipelineGroupId 流水线分组ID
+	 * @return 单页流水线列表
+	 */
+	private List<YunxiaoPipelineDTO> fetchSinglePagePipelines(long page, long perPage, String pipelineName, Long pipelineGroupId) {
+		String baseEndpoint = getBaseEndpoint();
+		StringBuilder pathBuilder = new StringBuilder(baseEndpoint).append(Constants.FLOW_BASE_PATH);
+
+		if (StringUtils.isNotBlank(yunxiaoProperties.getOrganizationId())) {
+			pathBuilder.append("/organizations/").append(yunxiaoProperties.getOrganizationId().trim());
+		}
+		pathBuilder.append("/pipelines");
+
+		UriComponentsBuilder builder = UriComponentsBuilder.fromHttpUrl(pathBuilder.toString())
+				.queryParam("page", page)
+				.queryParam("perPage", perPage);
+
+		if (StringUtils.isNotBlank(pipelineName)) {
+			builder.queryParam("pipelineName", pipelineName.trim());
+		}
+		if (pipelineGroupId != null) {
+			builder.queryParam("pipelineGroupId", pipelineGroupId);
+		}
+
+		String url = builder.toUriString();
+		HttpEntity<?> entity = createAuthEntity();
+
+		try {
+			log.info("开始请求云效查询单页流水线列表, url: {}", url);
+			ResponseEntity<String> response = yunxiaoRestTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+			String body = response.getBody();
+
+			if (StringUtils.isBlank(body)) {
+				log.warn("云效流水线查询返回为空响应");
+				return Collections.emptyList();
+			}
+
+			// 解析响应为流水线列表
+			return parseToPipelineList(body);
+		} catch (HttpStatusCodeException e) {
+			String responseBody = e.getResponseBodyAsString();
+			log.error("云效流水线查询 HTTP 异常, 状态码: {}, 响应体: {}", e.getStatusCode(), responseBody, e);
+			// 提取错误提示并抛出业务异常
+			throw new RuntimeException("云效流水线查询失败: " + extractErrorMessage(responseBody, e.getMessage()), e);
+		} catch (Exception e) {
+			log.error("云效流水线查询发生未预期异常: {}", e.getMessage(), e);
+			throw new RuntimeException("云效流水线查询异常: " + e.getMessage(), e);
+		}
+	}
+
+	/**
+	 * 循环分页抓取云效组织下的所有流水线数据并进行本地模糊过滤
+	 *
+	 * @param keyword 流水线名称模糊搜索词
+	 * @param groupId 流水线分组ID
+	 * @return 全量流水线列表
+	 */
+	private List<YunxiaoPipelineDTO> fetchAllPipelinesWithFilter(String keyword, Long groupId) {
+		List<YunxiaoPipelineDTO> allList = new ArrayList<>();
+		long currentPage = Constants.ONE_LONG;
+		long pageSize = Constants.HUNDRED_LONG;
+
+		// 最多循环抓取50页以防止异常死循环（支持最多5000条流水线）
+		for (int pageIndex = Constants.ZERO; pageIndex < Constants.FIFTY; pageIndex++) {
+			// 全量拉取时不向云效传递 keyword，避免云效服务端前缀过滤遗漏数据，统一在内存中进行包含匹配
+			List<YunxiaoPipelineDTO> pageData = fetchSinglePagePipelines(currentPage, pageSize, null, groupId);
+			if (CollectionUtils.isEmpty(pageData)) {
+				break;
+			}
+			allList.addAll(pageData);
+
+			// 若当前页返回条数小于每页条数上限，说明已到最后一页
+			if (pageData.size() < Constants.HUNDRED) {
+				break;
+			}
+			currentPage++;
+		}
+
+		// 本地模糊过滤
+		if (StringUtils.isNotBlank(keyword)) {
+			List<YunxiaoPipelineDTO> filtered = new ArrayList<>();
+			for (YunxiaoPipelineDTO p : allList) {
+				if (StringUtils.containsIgnoreCase(p.getPipelineName(), keyword)) {
+					filtered.add(p);
+				}
+			}
+			return filtered;
+		}
+
+		return allList;
+	}
+
+	/**
+	 * 对集合进行内存分页切片
+	 *
+	 * @param list     数据集合
+	 * @param pageNum  页码
+	 * @param pageSize 每页条数
+	 * @return 分页后的数据集合
+	 */
+	private List<YunxiaoPipelineDTO> paginateList(List<YunxiaoPipelineDTO> list, Integer pageNum, Integer pageSize) {
+		if (CollectionUtils.isEmpty(list)) {
+			return Collections.emptyList();
+		}
+		int page = (pageNum != null && pageNum > Constants.ZERO) ? pageNum : Constants.ONE;
+		int size = (pageSize != null && pageSize > Constants.ZERO) ? pageSize : Constants.TWENTY;
+		int fromIndex = (page - Constants.ONE) * size;
+		if (fromIndex >= list.size()) {
+			return Collections.emptyList();
+		}
+		int toIndex = Math.min(fromIndex + size, list.size());
+		return new ArrayList<>(list.subList(fromIndex, toIndex));
 	}
 
 	/**
@@ -1362,7 +1600,7 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 				: Constants.ONE_LONG;
 		long pageSize = (queryParam != null && queryParam.getPageSize() != null)
 				? queryParam.getPageSize().longValue()
-				: Constants.TWENTY_LONG;
+				: Constants.HUNDRED_LONG;
 
 		UriComponentsBuilder builder = UriComponentsBuilder.fromHttpUrl(pathBuilder.toString())
 				.queryParam("page", page)
@@ -1543,15 +1781,46 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 		Long pId = item.getLong("pipelineId") != null ? item.getLong("pipelineId") : item.getLong("id");
 		String name = item.getString("pipelineName") != null ? item.getString("pipelineName") : item.getString("name");
 		Long gId = item.getLong("groupId") != null ? item.getLong("groupId") : item.getLong("pipelineGroupId");
+		String rawEnv = item.getString("envName");
 
 		return YunxiaoPipelineDTO.builder()
 				.pipelineId(pId)
 				.pipelineName(name)
 				.groupId(gId)
 				.creatorAccountId(item.getString("creatorAccountId"))
-				.envName(item.getString("envName"))
+				.envName(extractEnvNameFromPipeline(name, rawEnv))
 				.createTime(item.getString("gmtCreate"))
 				.build();
+	}
+
+	/**
+	 * 根据流水线名称自动解析推导所属环境名称
+	 *
+	 * @param pipelineName 流水线名称
+	 * @param rawEnvName   原始环境名称
+	 * @return 规范化后的环境名称
+	 */
+	private String extractEnvNameFromPipeline(String pipelineName, String rawEnvName) {
+		if (StringUtils.isNotBlank(rawEnvName)) {
+			return rawEnvName;
+		}
+		if (StringUtils.isBlank(pipelineName)) {
+			return null;
+		}
+		// 优先判断预发环境，防止与开发环境或发布字样混淆
+		if (pipelineName.contains("预发环境") || pipelineName.contains("预发布环境") || pipelineName.contains("预发") || pipelineName.toLowerCase().startsWith("pre-")) {
+			return "预发布环境";
+		}
+		if (pipelineName.contains("开发环境") || pipelineName.contains("开发") || pipelineName.toLowerCase().startsWith("dev-")) {
+			return "开发环境";
+		}
+		if (pipelineName.contains("测试环境") || pipelineName.contains("测试") || pipelineName.toLowerCase().startsWith("test-")) {
+			return "测试环境";
+		}
+		if (pipelineName.contains("生产环境") || pipelineName.contains("生产") || pipelineName.toLowerCase().startsWith("prod-")) {
+			return "生产环境";
+		}
+		return null;
 	}
 
 	/**
@@ -1860,6 +2129,32 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 	}
 
 	/**
+	 * 构建默认标准环境分组（当云效 Token 缺少 pipelineGroups 接口权限时自动降级）
+	 *
+	 * @param queryParam 查询参数
+	 * @return 标准环境分组列表
+	 */
+	private List<YunxiaoPipelineGroupDTO> buildDefaultEnvironmentGroups(YunxiaoPipelineGroupQueryParam queryParam) {
+		List<YunxiaoPipelineGroupDTO> defaultGroups = new ArrayList<>();
+		defaultGroups.add(YunxiaoPipelineGroupDTO.builder().groupId(Constants.ONE_LONG).groupName("开发环境").build());
+		defaultGroups.add(YunxiaoPipelineGroupDTO.builder().groupId(Constants.TWO_LONG).groupName("测试环境").build());
+		defaultGroups.add(YunxiaoPipelineGroupDTO.builder().groupId(Constants.THREE_LONG).groupName("预发布环境").build());
+		defaultGroups.add(YunxiaoPipelineGroupDTO.builder().groupId(Constants.FOUR_LONG).groupName("生产环境").build());
+
+		if (queryParam != null && StringUtils.isNotBlank(queryParam.getGroupName())) {
+			String keyword = queryParam.getGroupName().trim();
+			List<YunxiaoPipelineGroupDTO> filtered = new ArrayList<>();
+			for (YunxiaoPipelineGroupDTO group : defaultGroups) {
+				if (StringUtils.containsIgnoreCase(group.getGroupName(), keyword)) {
+					filtered.add(group);
+				}
+			}
+			return filtered;
+		}
+		return defaultGroups;
+	}
+
+	/**
 	 * 根据分组名称解析流水线分组 ID
 	 *
 	 * @param groupName 分组名称
@@ -1968,5 +2263,22 @@ public class YunxiaoDevopsServiceImpl implements YunxiaoDevopsService {
 				.creatorAccountId(item.getString("creatorAccountId"))
 				.createTime(item.getString("gmtCreate"))
 				.build();
+	}
+
+	/**
+	 * 记录命中的流水线名称并返回其流水线ID
+	 *
+	 * @param runParam 运行参数
+	 * @param pipeline 流水线 DTO
+	 * @return 流水线 ID
+	 */
+	private Long recordPipelineAndReturnId(YunxiaoPipelineRunParam runParam, YunxiaoPipelineDTO pipeline) {
+		if (pipeline == null) {
+			return null;
+		}
+		if (runParam != null) {
+			runParam.setPipelineName(pipeline.getPipelineName());
+		}
+		return pipeline.getPipelineId();
 	}
 }

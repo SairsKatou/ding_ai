@@ -238,6 +238,36 @@ public class YunxiaoDevopsServiceTest {
 	}
 
 	/**
+	 * 测试未传分页参数时自动循环全量抓取所有流水线
+	 */
+	@Test
+	public void testListAllPipelinesWithoutPagination() {
+		Mockito.when(yunxiaoProperties.getAccessToken()).thenReturn("pt-mocktoken12345");
+		Mockito.when(yunxiaoProperties.getEndpoint()).thenReturn("openapi-rdc.aliyuncs.com");
+		Mockito.when(yunxiaoProperties.getOrganizationId()).thenReturn("mock-org-60b");
+
+		String mockPipelinesJson = "["
+				+ "{\"pipelineId\":5291871,\"pipelineName\":\"ct-modules-xjob-生产环境\"},"
+				+ "{\"pipelineId\":5206267,\"pipelineName\":\"ct-modules-xjob-开发环境\"}"
+				+ "]";
+
+		Mockito.when(yunxiaoRestTemplate.exchange(
+				Mockito.contains("/pipelines?page=1&perPage=100"),
+				Mockito.eq(HttpMethod.GET),
+				Mockito.any(HttpEntity.class),
+				Mockito.eq(String.class)
+		)).thenReturn(ResponseEntity.ok(mockPipelinesJson));
+
+		// 不传分页参数直接查询
+		List<YunxiaoPipelineDTO> result = yunxiaoDevopsService.listPipelines(new YunxiaoPipelineQueryParam());
+
+		Assertions.assertNotNull(result);
+		Assertions.assertEquals(Constants.TWO, result.size());
+		Assertions.assertEquals("生产环境", result.get(Constants.ZERO).getEnvName());
+		Assertions.assertEquals("开发环境", result.get(Constants.ONE).getEnvName());
+	}
+
+	/**
 	 * 测试触发云效流水线发布运行
 	 */
 	@Test
@@ -324,6 +354,60 @@ public class YunxiaoDevopsServiceTest {
 		// 测试空指令返回指南
 		String helpResult = yunxiaoDevopsService.releaseBranchForChat("发布分支");
 		Assertions.assertTrue(helpResult.contains("分支发布指令说明"));
+	}
+
+	/**
+	 * 测试模块简写模糊匹配（如 file dev 开发 -> ct-modules-file-开发环境）
+	 */
+	@Test
+	public void testReleaseBranchWithModuleShortName() {
+		Mockito.when(yunxiaoProperties.getAccessToken()).thenReturn("pt-mocktoken12345");
+		Mockito.when(yunxiaoProperties.getEndpoint()).thenReturn("openapi-rdc.aliyuncs.com");
+		Mockito.when(yunxiaoProperties.getOrganizationId()).thenReturn("mock-org-60b");
+
+		// 模拟查询分组为空
+		Mockito.when(yunxiaoRestTemplate.exchange(
+				Mockito.contains("/pipelineGroups"),
+				Mockito.eq(HttpMethod.GET),
+				Mockito.any(HttpEntity.class),
+				Mockito.eq(String.class)
+		)).thenReturn(ResponseEntity.ok("[]"));
+
+		// 模拟云效按 pipelineName=file 前缀搜索返回空
+		Mockito.when(yunxiaoRestTemplate.exchange(
+				Mockito.contains("pipelineName=file"),
+				Mockito.eq(HttpMethod.GET),
+				Mockito.any(HttpEntity.class),
+				Mockito.eq(String.class)
+		)).thenReturn(ResponseEntity.ok("[]"));
+
+		// 模拟自动拉取组织流水线列表
+		String mockAllPipelinesJson = "["
+				+ "{\"pipelineId\":9911,\"pipelineName\":\"ct-modules-file-开发环境\"},"
+				+ "{\"pipelineId\":9922,\"pipelineName\":\"ct-modules-scm-开发环境\"}"
+				+ "]";
+		Mockito.when(yunxiaoRestTemplate.exchange(
+				Mockito.contains("perPage=100"),
+				Mockito.eq(HttpMethod.GET),
+				Mockito.any(HttpEntity.class),
+				Mockito.eq(String.class)
+		)).thenReturn(ResponseEntity.ok(mockAllPipelinesJson));
+
+		// 模拟触发流水线运行
+		String mockRunResultJson = "{\"pipelineRunId\":778899,\"status\":\"RUNNING\"}";
+		Mockito.when(yunxiaoRestTemplate.exchange(
+				Mockito.contains("/pipelines/9911/run"),
+				Mockito.eq(HttpMethod.POST),
+				Mockito.any(HttpEntity.class),
+				Mockito.eq(String.class)
+		)).thenReturn(ResponseEntity.ok(mockRunResultJson));
+
+		// 执行指令：发布分支 file dev 开发
+		String chatResult = yunxiaoDevopsService.releaseBranchForChat("发布分支 file dev 开发");
+		Assertions.assertTrue(chatResult.contains("分支发布流水线已触发"));
+		Assertions.assertTrue(chatResult.contains("ct-modules-file-开发环境"));
+		Assertions.assertTrue(chatResult.contains("dev"));
+		Assertions.assertTrue(chatResult.contains("778899"));
 	}
 
 	/**

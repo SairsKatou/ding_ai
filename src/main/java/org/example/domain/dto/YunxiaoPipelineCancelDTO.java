@@ -30,6 +30,12 @@ public class YunxiaoPipelineCancelDTO implements Serializable {
     private Long pipelineId;
 
     /**
+     * 流水线名称
+     */
+    @ApiModelProperty(value = "流水线名称", example = "ct-modules-file-开发环境")
+    private String pipelineName;
+
+    /**
      * 流水线所属分组 ID
      */
     @ApiModelProperty(value = "流水线所属分组ID", example = "12345")

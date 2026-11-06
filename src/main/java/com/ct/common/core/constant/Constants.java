@@ -163,6 +163,21 @@ public class Constants {
     public static final Long ONE_LONG = 1L;
 
     /**
+     * Long 2
+     */
+    public static final Long TWO_LONG = 2L;
+
+    /**
+     * Long 3
+     */
+    public static final Long THREE_LONG = 3L;
+
+    /**
+     * Long 4
+     */
+    public static final Long FOUR_LONG = 4L;
+
+    /**
      * Long 10
      */
     public static final Long TEN_LONG = 10L;

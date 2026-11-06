@@ -61,6 +61,12 @@ public class YunxiaoPipelineRunParam implements Serializable {
     private String pipelineGroupName;
 
     /**
+     * 流水线名称 (可选，用于指定或匹配流水线)
+     */
+    @ApiModelProperty(value = "流水线名称", example = "ct-modules-file-开发环境")
+    private String pipelineName;
+
+    /**
      * 发布说明 / 运行备注
      */
     @ApiModelProperty(value = "发布说明备注", example = "钉钉群触发发布分支")

@@ -42,6 +42,12 @@ public class YunxiaoPipelineCancelParam implements Serializable {
     private String pipelineGroupName;
 
     /**
+     * 流水线名称 (可选)
+     */
+    @ApiModelProperty(value = "流水线名称", example = "ct-modules-file-开发环境")
+    private String pipelineName;
+
+    /**
      * 流水线运行批次 ID (可选，若为空则根据分支自动查找运行中的实例)
      */
     @ApiModelProperty(value = "流水线运行批次ID", example = "987654321")
