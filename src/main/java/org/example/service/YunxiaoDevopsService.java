@@ -3,13 +3,21 @@ package org.example.service;
 import org.example.domain.dto.YunxiaoBranchCreateParam;
 import org.example.domain.dto.YunxiaoBranchDTO;
 import org.example.domain.dto.YunxiaoBranchQueryParam;
+import org.example.domain.dto.YunxiaoPipelineCancelDTO;
+import org.example.domain.dto.YunxiaoPipelineCancelParam;
+import org.example.domain.dto.YunxiaoPipelineDTO;
+import org.example.domain.dto.YunxiaoPipelineGroupDTO;
+import org.example.domain.dto.YunxiaoPipelineGroupQueryParam;
+import org.example.domain.dto.YunxiaoPipelineQueryParam;
+import org.example.domain.dto.YunxiaoPipelineRunDTO;
+import org.example.domain.dto.YunxiaoPipelineRunParam;
 import org.example.domain.dto.YunxiaoRepositoryDTO;
 import org.example.domain.dto.YunxiaoRepositoryQueryParam;
 
 import java.util.List;
 
 /**
- * 云效 DevOps 代码库与分支管理服务
+ * 云效 DevOps 代码库、分支与流水线管理服务
  *
  * @author zeymo
  */
@@ -63,4 +71,68 @@ public interface YunxiaoDevopsService {
      * @return 创建结果或引导文本
      */
     String createBranchForChat(String userQuestion);
+
+    /**
+     * 查询云效流水线列表
+     *
+     * @param queryParam 查询参数
+     * @return 流水线列表
+     */
+    List<YunxiaoPipelineDTO> listPipelines(YunxiaoPipelineQueryParam queryParam);
+
+    /**
+     * 触发指定分支的云效流水线发布运行
+     *
+     * @param runParam 流水线运行参数
+     * @return 流水线运行结果
+     */
+    YunxiaoPipelineRunDTO runPipeline(YunxiaoPipelineRunParam runParam);
+
+    /**
+     * 解析钉钉群聊分支发布指令并触发流水线发布
+     *
+     * @param userQuestion 用户在群聊中的输入
+     * @return 发布结果展示 Markdown 文本
+     */
+    String releaseBranchForChat(String userQuestion);
+
+    /**
+     * 终止/取消指定流水线运行实例
+     *
+     * @param cancelParam 取消参数
+     * @return 取消结果
+     */
+    YunxiaoPipelineCancelDTO stopPipelineRun(YunxiaoPipelineCancelParam cancelParam);
+
+    /**
+     * 解析钉钉群聊取消分支发布指令并执行取消
+     *
+     * @param userQuestion 用户在群聊中的输入
+     * @return 取消结果展示 Markdown 文本
+     */
+    String cancelReleaseBranchForChat(String userQuestion);
+
+    /**
+     * 查询云效流水线分组列表
+     *
+     * @param queryParam 查询参数
+     * @return 流水线分组列表
+     */
+    List<YunxiaoPipelineGroupDTO> listPipelineGroups(YunxiaoPipelineGroupQueryParam queryParam);
+
+    /**
+     * 格式化流水线分组列表为群聊展示文本
+     *
+     * @param userQuestion 用户在群聊中的输入
+     * @return 格式化后的 Markdown 文本
+     */
+    String listPipelineGroupsForChat(String userQuestion);
+
+    /**
+     * 查询云效流水线分组及其下属各具体流水线列表
+     *
+     * @param queryParam 查询参数
+     * @return 包含各分组下流水线列表的聚合信息
+     */
+    List<YunxiaoPipelineGroupDTO> listPipelineGroupsWithPipelines(YunxiaoPipelineGroupQueryParam queryParam);
 }

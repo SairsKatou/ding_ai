@@ -132,18 +132,35 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 			return yunxiaoGitCloneService.cloneBranchForChat(trimmedQuery);
 		}
 
-		// 3. 创建分支指令
+		// 3. 取消分支发布指令（终止云效 Flow 流水线运行）
+		if (isCancelReleaseQuery(trimmedQuery)) {
+			// 解析钉钉群聊取消分支发布指令并执行取消
+			return yunxiaoDevopsService.cancelReleaseBranchForChat(trimmedQuery);
+		}
+
+		// 4. 分支发布指令（触发云效 Flow 流水线构建发布）
+		if (isBranchReleaseQuery(trimmedQuery)) {
+			// 解析钉钉群聊分支发布指令并触发流水线发布
+			return yunxiaoDevopsService.releaseBranchForChat(trimmedQuery);
+		}
+
+		// 5. 流水线分组查询指令
+		if (isPipelineGroupQuery(trimmedQuery)) {
+			return yunxiaoDevopsService.listPipelineGroupsForChat(trimmedQuery);
+		}
+
+		// 6. 创建分支指令
 		if (isBranchCreateQuery(trimmedQuery)) {
 			return yunxiaoDevopsService.createBranchForChat(trimmedQuery);
 		}
 
-		// 4. 项目与分支查询指令
+		// 7. 项目与分支查询指令
 		if (isDevopsQuery(trimmedQuery)) {
 			String searchKeyword = resolveDevopsSearchKeyword(trimmedQuery);
 			return yunxiaoDevopsService.formatRepositoriesAndBranchesForChat(searchKeyword);
 		}
 
-		// 5. 其余问题默认交由 OpenCode 大模型回答
+		// 8. 其余问题默认交由 OpenCode 大模型回答
 		return executeAiChat(trimmedQuery);
 	}
 
@@ -204,6 +221,56 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 	}
 
 	/**
+	 * 判断是否为取消分支发布指令
+	 *
+	 * @param text 用户输入
+	 * @return 是否为取消分支发布指令
+	 */
+	private boolean isCancelReleaseQuery(String text) {
+		if (StringUtils.isBlank(text)) {
+			return false;
+		}
+		// 匹配以取消发布、取消分支发布、停止发布等关键词开头的指令
+		return text.startsWith("取消发布分支")
+				|| text.startsWith("取消分支发布")
+				|| text.startsWith("取消发布")
+				|| text.startsWith("停止发布")
+				|| text.startsWith("中止发布")
+				|| text.startsWith("终止发布")
+				|| text.startsWith("撤销发布")
+				|| text.startsWith("取消部署")
+				|| text.startsWith("停止部署");
+	}
+
+	/**
+	 * 判断是否为分支发布或流水线部署指令
+	 *
+	 * @param text 用户输入
+	 * @return 是否为分支发布指令
+	 */
+	private boolean isBranchReleaseQuery(String text) {
+		if (StringUtils.isBlank(text)) {
+			return false;
+		}
+		// 匹配以发布分支、分支发布、发布代码等关键词开头的指令
+		return text.startsWith("发布分支")
+				|| text.startsWith("分支发布")
+				|| text.startsWith("发布代码")
+				|| text.startsWith("代码发布")
+				|| text.startsWith("部署分支")
+				|| text.startsWith("分支部署")
+				|| text.startsWith("部署代码")
+				|| text.startsWith("发布 ")
+				|| text.startsWith("发布:")
+				|| text.startsWith("发布：")
+				|| text.startsWith("部署 ")
+				|| text.startsWith("部署:")
+				|| text.startsWith("部署：")
+				|| "发布分支".equals(text)
+				|| "分支发布".equals(text);
+	}
+
+	/**
 	 * 判断是否为创建分支指令
 	 *
 	 * @param text 用户输入
@@ -216,6 +283,23 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 		return text.startsWith("创建分支")
 				|| text.startsWith("新建分支")
 				|| text.startsWith("拉分支");
+	}
+
+	/**
+	 * 判断是否为云效流水线分组查询指令
+	 *
+	 * @param text 用户输入
+	 * @return 是否为流水线分组查询指令
+	 */
+	private boolean isPipelineGroupQuery(String text) {
+		if (StringUtils.isBlank(text)) {
+			return false;
+		}
+		return text.startsWith("流水线分组")
+				|| text.startsWith("流水线组")
+				|| text.startsWith("分组列表")
+				|| text.startsWith("查询分组")
+				|| text.startsWith("查询流水线分组");
 	}
 
 	/**
@@ -295,7 +379,7 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 	 */
 	private String buildHelpMenu() {
 		return "### 💡 您好！我是智能开发助理机器人\n\n"
-				+ "> 随时为您提供云效代码库检索、分支管理与大模型智能代码审计支持。\n\n"
+				+ "> 随时为您提供云效代码库检索、分支管理、流水线发布与大模型智能代码审计支持。\n\n"
 				+ "---\n\n"
 				+ "#### 📌 常用指令指南\n\n"
 				+ "1. **📁 项目与分支查询**\n"
@@ -307,19 +391,36 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 				+ "   - 示例 1（默认项目与源分支）：`创建分支 feature/order-v1`\n"
 				+ "   - 示例 2（指定源分支）：`创建分支 feature/order-v1 dev`\n"
 				+ "   - 示例 3（完整指定）：`创建分支 changtai-cloud feature/order-v1 dev`\n\n"
-				+ "3. **🔄 克隆/同步分支代码（本地 Git 缓存）**\n"
+				+ "3. **🚀 分支发布（触发云效 Flow 流水线）**\n"
+				+ "   - 指令格式：`发布分支 [分组/仓库名] <待发布分支名> [环境/默认test] [流水线ID/可选]`\n"
+				+ "   - 说明：触发云效 Flow 流水线自动化构建部署，支持按分组或环境调度，实时返回批次ID与状态\n"
+				+ "   - 示例 1（发布指定分支）：`发布分支 feature/order-v1`\n"
+				+ "   - 示例 2（按环境发布）：`发布分支 feature/order-v1 生产`\n"
+				+ "   - 示例 3（按流水线分组发布）：`发布分支 分组=营销系统 分支=feature/coupon-v1`\n"
+				+ "   - 示例 4（按分组与环境发布）：`发布分支 营销系统 feature/coupon-v1 prod`\n\n"
+				+ "4. **🛑 取消分支发布（终止云效 Flow 流水线）**\n"
+				+ "   - 指令格式：`取消发布 [分支名/或运行批次ID] [环境/默认test] [分组/仓库名]`\n"
+				+ "   - 说明：向云效 Flow 发送终止指令，立即中止正在进行的构建发布\n"
+				+ "   - 示例 1（按分支名取消）：`取消发布 feature/order-v1`\n"
+				+ "   - 示例 2（取消生产环境发布）：`取消发布 feature/order-v1 生产`\n"
+				+ "   - 示例 3（按分组取消发布）：`取消发布 分组=营销系统 分支=feature/coupon-v1`\n"
+				+ "   - 示例 4（按批次ID取消）：`取消发布 987654321`\n\n"
+				+ "5. **📂 流水线分组查询**\n"
+				+ "   - 指令格式：`流水线分组` 或 `流水线分组 <关键词>`\n"
+				+ "   - 说明：列出当前云效组织下配置的所有流水线业务分组\n\n"
+				+ "6. **🔄 克隆/同步分支代码（本地 Git 缓存）**\n"
 				+ "   - 指令格式：`克隆分支 [仓库名/默认changtai-cloud] [分支名/默认dev]`\n"
 				+ "   - 说明：清空本地历史后重新浅克隆最新代码，缓存 2 小时\n"
 				+ "   - 示例 1（默认项目与分支）：`克隆分支`\n"
 				+ "   - 示例 2（自定义分支）：`克隆分支 dev` 或 `克隆分支 master`\n"
 				+ "   - 示例 3（完整指定）：`克隆分支 changtai-cloud dev`\n\n"
-				+ "4. **🔍 分支代码扫描与大模型审计**\n"
+				+ "6. **🔍 分支代码扫描与大模型审计**\n"
 				+ "   - 快速扫描（最多 3 轮，可补读源码）：`代码扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <问题诉求>`\n"
 				+ "   - 深度探查（多轮 Agent）：`深度扫描 [项目名/默认changtai-cloud] [分支名/默认dev] <问题诉求>`\n"
 				+ "   - 示例 1（快速梳理）：`代码扫描 梳理实报费用新增的校验逻辑`\n"
 				+ "   - 示例 2（多轮深度探查表名）：`深度扫描 调拨单涉及的表名是哪些`\n"
 				+ "   - 示例 3（指定分支深度扫描）：`深度扫描 分支 dev 调拨单涉及的表名`\n\n"
-				+ "5. **💬 OpenCode 技术通用问答**\n"
+				+ "7. **💬 OpenCode 技术通用问答**\n"
 				+ "   - 直接在群内输入任何技术问题、SQL 调优或代码重构问题，即可实时解答！";
 	}
 }

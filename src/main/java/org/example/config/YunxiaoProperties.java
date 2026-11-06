@@ -48,4 +48,19 @@ public class YunxiaoProperties {
      * 本地克隆缓存过期时间（小时，默认 2 小时）
      */
     private Integer cloneCacheExpireHours = 2;
+
+    /**
+     * 默认发布流水线 ID (可选)
+     */
+    private Long defaultPipelineId;
+
+    /**
+     * 默认发布流水线名称或关键词 (可选)
+     */
+    private String defaultPipelineName;
+
+    /**
+     * 默认发布环境 (支持 dev/test/pre/prod 或自定义环境名，默认 test)
+     */
+    private String defaultEnv = "test";
 }

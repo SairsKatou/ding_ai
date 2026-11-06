@@ -9,6 +9,7 @@ import org.example.service.RobotGroupMessagesService;
 import org.example.service.YunxiaoCodeScanService;
 import org.example.service.YunxiaoDevopsService;
 import org.example.service.YunxiaoGitCloneService;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -117,9 +118,11 @@ public class ChatBotCallbackListenerTest {
         Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "help");
         assertNotNull(reply);
         String text = reply.toString();
-        org.junit.jupiter.api.Assertions.assertTrue(text.contains("### 💡 您好！我是智能开发助理机器人"));
-        org.junit.jupiter.api.Assertions.assertTrue(text.contains("常用指令指南"));
-        org.junit.jupiter.api.Assertions.assertTrue(text.contains("changtai-cloud"));
+        Assertions.assertTrue(text.contains("### 💡 您好！我是智能开发助理机器人"));
+        Assertions.assertTrue(text.contains("常用指令指南"));
+        Assertions.assertTrue(text.contains("changtai-cloud"));
+        Assertions.assertTrue(text.contains("分支发布"));
+        Assertions.assertTrue(text.contains("取消分支发布"));
     }
 
 	/**
@@ -133,7 +136,7 @@ public class ChatBotCallbackListenerTest {
 		Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "查询 changtai-cloud");
 
 		assertNotNull(reply);
-		org.junit.jupiter.api.Assertions.assertEquals("项目查询结果: changtai-cloud", reply.toString());
+		Assertions.assertEquals("项目查询结果: changtai-cloud", reply.toString());
 		verify(yunxiaoDevopsService).formatRepositoriesAndBranchesForChat("changtai-cloud");
 		verify(openCodeService, never()).chat(any(String.class));
 	}
@@ -149,8 +152,56 @@ public class ChatBotCallbackListenerTest {
 		Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "项目列表");
 
 		assertNotNull(reply);
-		org.junit.jupiter.api.Assertions.assertEquals("全部项目列表", reply.toString());
+		Assertions.assertEquals("全部项目列表", reply.toString());
 		verify(yunxiaoDevopsService).formatRepositoriesAndBranchesForChat("");
 		verify(openCodeService, never()).chat(any(String.class));
 	}
+
+    /**
+     * 测试输入「发布分支 feature/order-v1」分发至流水线发布处理
+     */
+    @Test
+    public void testReleaseBranchCommandDispatched() {
+        when(yunxiaoDevopsService.releaseBranchForChat(eq("发布分支 feature/order-v1")))
+                .thenReturn("分支发布流水线已触发");
+
+        Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "发布分支 feature/order-v1");
+
+        assertNotNull(reply);
+        Assertions.assertEquals("分支发布流水线已触发", reply.toString());
+        verify(yunxiaoDevopsService).releaseBranchForChat("发布分支 feature/order-v1");
+        verify(openCodeService, never()).chat(any(String.class));
+    }
+
+    /**
+     * 测试输入「取消发布 feature/order-v1」分发至取消发布处理
+     */
+    @Test
+    public void testCancelReleaseBranchCommandDispatched() {
+        when(yunxiaoDevopsService.cancelReleaseBranchForChat(eq("取消发布 feature/order-v1")))
+                .thenReturn("分支发布已成功取消");
+
+        Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "取消发布 feature/order-v1");
+
+        assertNotNull(reply);
+        Assertions.assertEquals("分支发布已成功取消", reply.toString());
+        verify(yunxiaoDevopsService).cancelReleaseBranchForChat("取消发布 feature/order-v1");
+        verify(openCodeService, never()).chat(any(String.class));
+    }
+
+    /**
+     * 测试输入「流水线分组」分发至分组查询处理
+     */
+    @Test
+    public void testPipelineGroupCommandDispatched() {
+        when(yunxiaoDevopsService.listPipelineGroupsForChat(eq("流水线分组 订单")))
+                .thenReturn("云效流水线分组列表");
+
+        Object reply = ReflectionTestUtils.invokeMethod(chatBotCallbackListener, "handleUserQuery", "流水线分组 订单");
+
+        assertNotNull(reply);
+        Assertions.assertEquals("云效流水线分组列表", reply.toString());
+        verify(yunxiaoDevopsService).listPipelineGroupsForChat("流水线分组 订单");
+        verify(openCodeService, never()).chat(any(String.class));
+    }
 }

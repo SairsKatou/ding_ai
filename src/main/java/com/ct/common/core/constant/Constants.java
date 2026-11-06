@@ -163,9 +163,19 @@ public class Constants {
     public static final Long ONE_LONG = 1L;
 
     /**
+     * Long 10
+     */
+    public static final Long TEN_LONG = 10L;
+
+    /**
      * Long 20
      */
     public static final Long TWENTY_LONG = 20L;
+
+    /**
+     * Long 30
+     */
+    public static final Long THIRTY_LONG = 30L;
 
     /**
      * Long 100
@@ -191,6 +201,16 @@ public class Constants {
      * 默认分支名称 dev
      */
     public static final String DEFAULT_DEV_BRANCH = "dev";
+
+    /**
+     * 默认发布环境 test
+     */
+    public static final String DEFAULT_ENV = "test";
+
+    /**
+     * 云效 Flow 流水线基础 API 路径
+     */
+    public static final String FLOW_BASE_PATH = "/oapi/v1/flow";
 
     /**
      * UTF-8 字符集
