@@ -27,6 +27,8 @@ public class EnumMappingManager {
         registerEnum(BranchReleaseModeEnum.class.getSimpleName(), buildBranchReleaseModeItems());
         // 注册发布环境枚举
         registerEnum(ReleaseEnvironmentEnum.class.getSimpleName(), buildReleaseEnvironmentItems());
+        // 注册机器人消息表情表态状态枚举
+        registerEnum(RobotEmotionStatusEnum.class.getSimpleName(), buildRobotEmotionStatusItems());
     }
 
     /**
@@ -95,6 +97,22 @@ public class EnumMappingManager {
             Map<String, String> item = new HashMap<>();
             item.put("code", envEnum.getCode());
             item.put("description", envEnum.getDescription());
+            list.add(item);
+        }
+        return Collections.unmodifiableList(list);
+    }
+
+    /**
+     * 构建机器人消息表情表态状态枚举项列表
+     *
+     * @return 映射列表
+     */
+    private static List<Map<String, String>> buildRobotEmotionStatusItems() {
+        List<Map<String, String>> list = new ArrayList<>();
+        for (RobotEmotionStatusEnum statusEnum : RobotEmotionStatusEnum.values()) {
+            Map<String, String> item = new HashMap<>();
+            item.put("code", statusEnum.getCode());
+            item.put("description", statusEnum.getDescription());
             list.add(item);
         }
         return Collections.unmodifiableList(list);

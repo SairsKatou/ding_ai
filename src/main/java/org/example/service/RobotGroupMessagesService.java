@@ -9,10 +9,16 @@ import com.aliyun.tea.TeaException;
 import com.aliyun.teaopenapi.models.Config;
 import com.aliyun.teautil.models.RuntimeOptions;
 import com.ct.common.core.constant.Constants;
+import com.ct.common.core.enums.RobotEmotionStatusEnum;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
@@ -40,10 +46,22 @@ public class RobotGroupMessagesService {
     // 默认首屏展示标题
     private static final String DEFAULT_MSG_TITLE = "智能开发助手消息";
 
+    // 钉钉机器人添加表情回应 API 地址
+    private static final String EMOTION_REPLY_URL = "https://api.dingtalk.com/v1.0/robot/emotion/reply";
+
+    // 钉钉机器人撤回表情回应 API 地址
+    private static final String EMOTION_RECALL_URL = "https://api.dingtalk.com/v1.0/robot/emotion/recall";
+
+    // 钉钉 OpenAPI AccessToken 请求头名称
+    private static final String HEADER_ACCESS_TOKEN = "x-acs-dingtalk-access-token";
+
     private Client robotClient;
 
     @Resource
     private AccessTokenService accessTokenService;
+
+    @Resource(name = "yunxiaoRestTemplate")
+    private RestTemplate yunxiaoRestTemplate;
 
     @Value("${robot.code}")
     private String robotCode;
@@ -135,5 +153,78 @@ public class RobotGroupMessagesService {
             }
         }
         return DEFAULT_MSG_TITLE;
+    }
+
+    /**
+     * 为指定消息添加文字表情表态（如“思考中”、“完成”）
+     *
+     * @param openConversationId 群会话 ID
+     * @param openMsgId          目标消息 ID
+     * @param statusEnum         表情表态状态枚举
+     */
+    public void addEmotionReply(String openConversationId, String openMsgId, RobotEmotionStatusEnum statusEnum) {
+        sendEmotionRequest(EMOTION_REPLY_URL, openConversationId, openMsgId, statusEnum);
+    }
+
+    /**
+     * 撤回指定消息上的文字表情表态（如撤回“思考中”切换为“完成”）
+     *
+     * @param openConversationId 群会话 ID
+     * @param openMsgId          目标消息 ID
+     * @param statusEnum         表情表态状态枚举
+     */
+    public void recallEmotionReply(String openConversationId, String openMsgId, RobotEmotionStatusEnum statusEnum) {
+        sendEmotionRequest(EMOTION_RECALL_URL, openConversationId, openMsgId, statusEnum);
+    }
+
+    /**
+     * 执行钉钉机器人表情表态 HTTP 请求（非阻塞主流程，异常仅告警）
+     *
+     * @param url                请求接口地址
+     * @param openConversationId 群会话 ID
+     * @param openMsgId          目标消息 ID
+     * @param statusEnum         表情表态状态枚举
+     */
+    private void sendEmotionRequest(String url, String openConversationId, String openMsgId,
+                                    RobotEmotionStatusEnum statusEnum) {
+        if (StringUtils.isBlank(openConversationId) || StringUtils.isBlank(openMsgId) || Objects.isNull(statusEnum)) {
+            return;
+        }
+        try {
+            // 获取企业内部应用 AccessToken
+            String accessToken = accessTokenService.getAccessToken();
+            if (StringUtils.isBlank(accessToken)) {
+                log.warn("发送消息表情表态跳过：获取钉钉 AccessToken 为空, msgId={}", openMsgId);
+                return;
+            }
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.set(HEADER_ACCESS_TOKEN, accessToken);
+
+            // 构造文字表情请求体
+            JSONObject textEmotion = new JSONObject();
+            textEmotion.put("emotionId", statusEnum.getEmotionId());
+            textEmotion.put("emotionName", statusEnum.getEmotionText());
+            textEmotion.put("text", statusEnum.getEmotionText());
+            textEmotion.put("backgroundId", statusEnum.getBackgroundId());
+
+            JSONObject body = new JSONObject();
+            body.put("robotCode", robotCode);
+            body.put("openMsgId", openMsgId);
+            body.put("openConversationId", openConversationId);
+            // emotionType 为 2 表示文字表情表态
+            body.put("emotionType", Constants.TWO);
+            body.put("emotionName", statusEnum.getEmotionText());
+            body.put("textEmotion", textEmotion);
+
+            HttpEntity<String> entity = new HttpEntity<>(body.toJSONString(), headers);
+            RestTemplate client = Objects.nonNull(yunxiaoRestTemplate) ? yunxiaoRestTemplate : new RestTemplate();
+            client.exchange(url, HttpMethod.POST, entity, String.class);
+        } catch (Exception e) {
+            // 表态失败不影响主业务消息回复流程
+            log.warn("执行钉钉消息表情表态失败, url={}, msgId={}, status={}, error={}",
+                    url, openMsgId, statusEnum.getCode(), e.getMessage());
+        }
     }
 }

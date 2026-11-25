@@ -1,6 +1,7 @@
 package org.example.callback.chatbot;
 
 import com.alibaba.fastjson.JSONObject;
+import com.ct.common.core.enums.RobotEmotionStatusEnum;
 import com.dingtalk.open.app.api.models.bot.ChatbotMessage;
 import com.dingtalk.open.app.api.models.bot.MessageContent;
 import org.example.service.DingTalkMessageDeduplicatorService;
@@ -203,5 +204,28 @@ public class ChatBotCallbackListenerTest {
         Assertions.assertEquals("云效流水线分组列表", reply.toString());
         verify(yunxiaoDevopsService).listPipelineGroupsForChat("流水线分组 订单");
         verify(openCodeService, never()).chat(any(String.class));
+    }
+
+    /**
+     * 测试异步处理消息时触发思考中与完成表情表态流转
+     */
+    @Test
+    public void testProcessMessageAsyncEmotionLifecycle() throws Exception {
+        when(yunxiaoDevopsService.formatRepositoriesAndBranchesForChat(eq("changtai-cloud")))
+                .thenReturn("项目查询结果");
+
+        ReflectionTestUtils.invokeMethod(
+                chatBotCallbackListener,
+                "processMessageAsync",
+                "msg_emotion_001",
+                "@机器人 查询 changtai-cloud",
+                "user001",
+                "cid123"
+        );
+
+        verify(robotGroupMessagesService).addEmotionReply("cid123", "msg_emotion_001", RobotEmotionStatusEnum.THINKING);
+        verify(robotGroupMessagesService).send("cid123", "user001", "项目查询结果");
+        verify(robotGroupMessagesService).recallEmotionReply("cid123", "msg_emotion_001", RobotEmotionStatusEnum.THINKING);
+        verify(robotGroupMessagesService).addEmotionReply("cid123", "msg_emotion_001", RobotEmotionStatusEnum.COMPLETED);
     }
 }

@@ -7,19 +7,26 @@ import com.aliyun.dingtalkrobot_1_0.models.OrgGroupSendRequest;
 import com.aliyun.dingtalkrobot_1_0.models.OrgGroupSendResponse;
 import com.aliyun.dingtalkrobot_1_0.models.OrgGroupSendResponseBody;
 import com.aliyun.teautil.models.RuntimeOptions;
+import com.ct.common.core.enums.RobotEmotionStatusEnum;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.client.RestTemplate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -82,5 +89,34 @@ public class RobotGroupMessagesServiceTest {
         assertEquals("审核结果", param.getString("title"));
         assertEquals(markdownContent, param.getString("text"));
         assertTrue(param.getJSONArray("atUserIds").contains("staff-001"));
+    }
+
+    /**
+     * 测试添加与撤回消息表情表态
+     */
+    @Test
+    public void testAddAndRecallEmotionReply() {
+        RestTemplate restTemplate = Mockito.mock(RestTemplate.class);
+        ReflectionTestUtils.setField(robotGroupMessagesService, "yunxiaoRestTemplate", restTemplate);
+        when(accessTokenService.getAccessToken()).thenReturn("test-access-token");
+        when(restTemplate.exchange(any(String.class), eq(HttpMethod.POST), any(HttpEntity.class), eq(String.class)))
+                .thenReturn(ResponseEntity.ok("{\"success\":true}"));
+
+        robotGroupMessagesService.addEmotionReply("cid-12345", "msg-001", RobotEmotionStatusEnum.THINKING);
+        robotGroupMessagesService.recallEmotionReply("cid-12345", "msg-001", RobotEmotionStatusEnum.THINKING);
+        robotGroupMessagesService.addEmotionReply("cid-12345", "msg-001", RobotEmotionStatusEnum.COMPLETED);
+
+        verify(restTemplate, Mockito.times(2)).exchange(
+                eq("https://api.dingtalk.com/v1.0/robot/emotion/reply"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(String.class)
+        );
+        verify(restTemplate).exchange(
+                eq("https://api.dingtalk.com/v1.0/robot/emotion/recall"),
+                eq(HttpMethod.POST),
+                any(HttpEntity.class),
+                eq(String.class)
+        );
     }
 }

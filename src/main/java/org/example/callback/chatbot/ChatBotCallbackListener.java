@@ -2,6 +2,7 @@ package org.example.callback.chatbot;
 
 import com.alibaba.fastjson.JSONObject;
 import com.ct.common.core.constant.Constants;
+import com.ct.common.core.enums.RobotEmotionStatusEnum;
 import com.dingtalk.open.app.api.callback.OpenDingTalkCallbackListener;
 import com.dingtalk.open.app.api.models.bot.ChatbotMessage;
 import com.dingtalk.open.app.api.models.bot.MessageContent;
@@ -78,7 +79,7 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 		String openConversationId = message.getConversationId();
 
 		// 2. 立即提交至线程池异步处理，避免同步耗时操作触发钉钉服务端 3-5 秒超时重推机制
-		botMessageExecutor.execute(() -> processMessageAsync(rawMsg, senderStaffId, openConversationId));
+		botMessageExecutor.execute(() -> processMessageAsync(msgId, rawMsg, senderStaffId, openConversationId));
 
 		// 3. 毫秒级即时应答 ACK
 		return new JSONObject();
@@ -87,11 +88,14 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 	/**
 	 * 异步处理用户消息并回复钉钉群
 	 *
+	 * @param msgId              原消息 ID
 	 * @param rawMsg             原始消息文本
 	 * @param senderStaffId      发送人用户ID
 	 * @param openConversationId 钉钉群会话ID
 	 */
-	private void processMessageAsync(String rawMsg, String senderStaffId, String openConversationId) {
+	private void processMessageAsync(String msgId, String rawMsg, String senderStaffId, String openConversationId) {
+		// 添加“思考中”表情表态，向用户即时反馈处理进度
+		robotGroupMessagesService.addEmotionReply(openConversationId, msgId, RobotEmotionStatusEnum.THINKING);
 		try {
 			log.info("异步开始处理群聊机器人消息, 发送人: {}, 内容: {}", senderStaffId, rawMsg);
 			// 剔除 @机器人 前缀名称（例如 @项目逻辑查询 等）
@@ -105,6 +109,10 @@ public class ChatBotCallbackListener implements OpenDingTalkCallbackListener<Cha
 			robotGroupMessagesService.send(openConversationId, senderStaffId, result);
 		} catch (Exception e) {
 			log.error("异步处理钉钉机器人消息异常: " + e.getMessage(), e);
+		} finally {
+			// 撤回“思考中”表态并添加“完成”表情表态
+			robotGroupMessagesService.recallEmotionReply(openConversationId, msgId, RobotEmotionStatusEnum.THINKING);
+			robotGroupMessagesService.addEmotionReply(openConversationId, msgId, RobotEmotionStatusEnum.COMPLETED);
 		}
 	}
 
